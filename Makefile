@@ -2,11 +2,11 @@
 -include ../../tools/kconfig/.config
 
 OS:=$(shell uname)
-CC:=$(CROSS_COMPILE)gcc
+CC:=$(CROSS_COMPILE)cc
 LD:=$(CROSS_COMPILE)ld
 AR:=$(CROSS_COMPILE)ar
 RANLIB:=$(CROSS_COMPILE)ranlib
-SIZE:=$(CROSS_COMPILE)size
+SIZE:=true
 STRIP_BIN:=$(CROSS_COMPILE)strip
 TEST_LDFLAGS=-pthread  $(PREFIX)/modules/*.o $(PREFIX)/lib/*.o -lvdeplug
 UNIT_LDFLAGS=-lcheck -lm -pthread -lrt -lsubunit
@@ -15,7 +15,7 @@ UNIT_CFLAGS= $(CFLAGS) -Wno-missing-braces
 LIBNAME:="libpicotcp.a"
 
 PREFIX?=$(PWD)/build
-DEBUG?=1
+DEBUG?=0
 PROFILE?=0
 PERF?=0
 ENDIAN?=little
@@ -89,6 +89,7 @@ endif
 
 EXTRA_CFLAGS+=-DPICO_COMPILE_TIME=`date +%s`
 EXTRA_CFLAGS+=$(PLATFORM_CFLAGS)
+EXTRA_CFLAGS+=-g
 
 CFLAGS=-I$(PREFIX)/include -Iinclude -Imodules  $(EXTRA_CFLAGS)
 # options for adding warnings
@@ -347,14 +348,14 @@ all: mod core lib
 
 core: $(CORE_OBJ)
 	@mkdir -p $(PREFIX)/lib
-	@mv stack/*.o $(PREFIX)/lib
+	@cp stack/*.o $(PREFIX)/lib
 
 mod: $(MOD_OBJ)
 	@mkdir -p $(PREFIX)/modules
-	@mv modules/*.o $(PREFIX)/modules || echo
+	@cp modules/*.o $(PREFIX)/modules || echo
 
 posix: all $(POSIX_OBJ)
-	@mv modules/*.o $(PREFIX)/modules || echo
+	@cp modules/*.o $(PREFIX)/modules || echo
 
 
 TEST_ELF= test/picoapp.elf
@@ -384,7 +385,6 @@ $(PREFIX)/include/pico_defines.h:
 
 
 deps: $(PREFIX)/include/pico_defines.h
-
 
 
 lib: mod core
@@ -493,6 +493,18 @@ dummy: mod core lib $(DUMMY_EXTRA)
 	@$(CC) -o dummy test/dummy.o $(DUMMY_EXTRA) $(PREFIX)/lib/libpicotcp.a $(LDFLAGS) $(CFLAGS)
 	@echo done.
 	@rm -f test/dummy.o dummy
+
+EXPORTED_FUNCTIONS:=["_main", "_pico_stack_recv", "_pico_stack_tick", "_pico_js_create", "_js_add_ipv4", "_pico_icmp4_ping", "_pico_socket_open", "_pico_socket_connect"]
+EXTRA_EXPORTED_RUNTIME_METHODS:=["ccall", "cwrap", "addFunction", "removeFunction"]
+RESERVED_FUNCTION_POINTERS:=20
+
+picotcp: mod core lib
+	$(CC) -c -o picotcp.o picotcp.c $(CFLAGS) -g
+	$(CC) -o picotcp.bc picotcp.o $(DUMMY_EXTRA) $(PREFIX)/lib/libpicotcp.a $(LDFLAGS) $(CFLAGS) -g
+	$(CC) -v -s WASM=1 --pre-js pre.js -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='${EXPORTED_FUNCTIONS}' -s EXTRA_EXPORTED_RUNTIME_METHODS='${EXTRA_EXPORTED_RUNTIME_METHODS}' -O3 picotcp.bc -o picotcp.js --minify 0 -s EXPORT_ALL=1 -s RESERVED_FUNCTION_POINTERS='${RESERVED_FUNCTION_POINTERS}' -g4
+	# HACK: Cannot be done via `--post-js` because
+	# Emscripten's JavaScript parser does not like ES6 modules.
+	cat post.js >> picotcp.js
 
 ppptest: test/ppp.c lib
 	gcc -ggdb -c -o ppp.o test/ppp.c -I $(PREFIX)/include/ -I $(PREFIX)/modules/ $(CFLAGS)
