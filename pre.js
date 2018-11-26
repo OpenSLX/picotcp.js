@@ -1,4 +1,6 @@
 Module["locateFile"] = function(path) {
-  return import.meta.url + "/../" + path;
+  let url = import.meta.url;
+  url = url.replace(/^file:\/\//, "");
+  return url + "/../" + path;
 };
 Module["noExitRuntime"] = true;
