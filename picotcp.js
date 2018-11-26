@@ -28,7 +28,9 @@ var Module = typeof Module !== 'undefined' ? Module : {};
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
 Module["locateFile"] = function(path) {
-  return import.meta.url + "/../" + path;
+  let url = import.meta.url;
+  url = url.replace(/^file:\/\//, "");
+  return url + "/../" + path;
 };
 Module["noExitRuntime"] = true;
 
