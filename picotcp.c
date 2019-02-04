@@ -133,7 +133,7 @@ static void js_wakeup(uint16_t ev, struct pico_socket *s) {
         ), s, len);
         PICO_FREE(buf2);
     }
-    if (ev & PICO_SOCK_EV_FIN) {
+    if (ev & (PICO_SOCK_EV_FIN | PICO_SOCK_EV_CLOSE)) {
         EM_ASM((Module.pointers[$0].readable._close();), s);
     }
     }
