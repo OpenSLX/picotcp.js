@@ -42,6 +42,27 @@ Module["locateFile"] = function(path) {
 };
 Module["noExitRuntime"] = true;
 
+// HACK: Work around https://github.com/emscripten-core/emscripten/issues/7855
+// for Node.js: turn process.on("uncaughtException" | "unhandledRejection", ...)
+// into no-op.
+let process;
+try {
+  process = new Proxy(global.process, {
+    get(target, key, receiver) {
+      const ret = Reflect.get(target, key, receiver);
+      if (key !== "on") return ret;
+      return new Proxy(ret, {
+        apply(target, thisArg, args) {
+          if (args[0] !== "uncaughtException"
+            && args[0] !== "unhandledRejection") {
+            return Reflect.apply(target, thisArg, args);
+          }
+        }
+      });
+    }
+  });
+} catch {}
+
 
 
 // Sometimes an existing Module object exists with properties
