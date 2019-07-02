@@ -494,13 +494,13 @@ dummy: mod core lib $(DUMMY_EXTRA)
 	@echo done.
 	@rm -f test/dummy.o dummy
 
-EXPORTED_FUNCTIONS:=["_main", "_pico_stack_recv", "_pico_stack_tick", "_pico_js_create", "_js_add_ipv4", "_pico_icmp4_ping", "_pico_socket_open", "_pico_socket_connect"]
+EXPORTED_FUNCTIONS:=["_main", "_pico_stack_recv", "_pico_stack_tick", "_pico_js_create", "_js_add_ipv4", "_pico_icmp4_ping", "_pico_socket_open", "_pico_socket_connect", "_pico_dhcp_initiate_negotiation", "_pico_dhcp_get_address", "_pico_dhcp_server_initiate"]
 EXTRA_EXPORTED_RUNTIME_METHODS:=["ccall", "cwrap", "addFunction", "removeFunction"]
 RESERVED_FUNCTION_POINTERS:=20
 
 picotcp: mod core lib
 	$(CC) -c -o picotcp.o picotcp.c $(CFLAGS) -g
-	$(CC) -o picotcp.bc picotcp.o $(DUMMY_EXTRA) $(PREFIX)/lib/libpicotcp.a $(LDFLAGS) $(CFLAGS) -g
+	$(CC) -o picotcp.bc picotcp.o $(DUMMY_EXTRA) $(PREFIX)/lib/libpicotcp.a $(LDFLAGS) $(CFLAGS) -g -s EXPORTED_FUNCTIONS='${EXPORTED_FUNCTIONS}'
 	$(CC) -v -s WASM=1 --pre-js pre.js -s MODULARIZE=1 -s EXPORTED_FUNCTIONS='${EXPORTED_FUNCTIONS}' -s EXTRA_EXPORTED_RUNTIME_METHODS='${EXTRA_EXPORTED_RUNTIME_METHODS}' -O3 picotcp.bc -o picotcp.js --minify 0 -s EXPORT_ALL=1 -s RESERVED_FUNCTION_POINTERS='${RESERVED_FUNCTION_POINTERS}' -g4
 	# HACK: Cannot be done via `--post-js` because
 	# Emscripten's JavaScript parser does not like ES6 modules.
