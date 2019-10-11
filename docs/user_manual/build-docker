@@ -1,0 +1,4 @@
+#!/bin/sh
+
+docker build .
+exec docker cp "$(docker create "$(docker build -q .)")":/mnt/user_doc.pdf .
