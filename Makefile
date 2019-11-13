@@ -494,7 +494,7 @@ dummy: mod core lib $(DUMMY_EXTRA)
 	@echo done.
 	@rm -f test/dummy.o dummy
 
-EXPORTED_FUNCTIONS:=["_main", "_pico_stack_recv", "_pico_stack_tick", "_pico_js_create", "_js_add_ipv4", "_pico_icmp4_ping", "_pico_socket_open", "_pico_socket_connect", "_pico_dhcp_initiate_negotiation", "_pico_dhcp_get_address", "_pico_dhcp_server_initiate"]
+EXPORTED_FUNCTIONS:=["_main", "_pico_stack_recv", "_pico_stack_tick", "_pico_js_create", "_js_add_ipv4", "_pico_icmp4_ping", "_pico_socket_open", "_pico_socket_connect", "_pico_dhcp_initiate_negotiation", "_pico_dhcp_get_address", "_pico_dhcp_server_initiate", "_pico_dns_client_getaddr", "_pico_dns_client_getname"]
 EXTRA_EXPORTED_RUNTIME_METHODS:=["ccall", "cwrap", "addFunction", "removeFunction"]
 RESERVED_FUNCTION_POINTERS:=20
 
