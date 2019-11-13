@@ -78,13 +78,11 @@ for (key in Module) {
   }
 }
 
-Module['arguments'] = [];
-Module['thisProgram'] = './this.program';
-Module['quit'] = function(status, toThrow) {
+var arguments_ = [];
+var thisProgram = './this.program';
+var quit_ = function(status, toThrow) {
   throw toThrow;
 };
-Module['preRun'] = [];
-Module['postRun'] = [];
 
 // Determine the runtime environment we are in. You can customize this by
 // setting the ENVIRONMENT setting at compile time (see settings.js).
@@ -92,10 +90,17 @@ Module['postRun'] = [];
 var ENVIRONMENT_IS_WEB = false;
 var ENVIRONMENT_IS_WORKER = false;
 var ENVIRONMENT_IS_NODE = false;
+var ENVIRONMENT_HAS_NODE = false;
 var ENVIRONMENT_IS_SHELL = false;
 ENVIRONMENT_IS_WEB = typeof window === 'object';
 ENVIRONMENT_IS_WORKER = typeof importScripts === 'function';
-ENVIRONMENT_IS_NODE = typeof process === 'object' && typeof require === 'function' && !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_WORKER;
+// A web environment like Electron.js can have Node enabled, so we must
+// distinguish between Node-enabled environments and Node environments per se.
+// This will allow the former to do things like mount NODEFS.
+// Extended check using process.versions fixes issue #8816.
+// (Also makes redundant the original check that 'require' is a function.)
+ENVIRONMENT_HAS_NODE = typeof process === 'object' && typeof process.versions === 'object' && typeof process.versions.node === 'string';
+ENVIRONMENT_IS_NODE = ENVIRONMENT_HAS_NODE && !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_WORKER;
 ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIRONMENT_IS_WORKER;
 
 
@@ -113,10 +118,15 @@ var scriptDirectory = '';
 function locateFile(path) {
   if (Module['locateFile']) {
     return Module['locateFile'](path, scriptDirectory);
-  } else {
-    return scriptDirectory + path;
   }
+  return scriptDirectory + path;
 }
+
+// Hooks that are implemented differently in different runtime environments.
+var read_,
+    readAsync,
+    readBinary,
+    setWindowTitle;
 
 if (ENVIRONMENT_IS_NODE) {
   scriptDirectory = __dirname + '/';
@@ -126,7 +136,7 @@ if (ENVIRONMENT_IS_NODE) {
   var nodeFS;
   var nodePath;
 
-  Module['read'] = function shell_read(filename, binary) {
+  read_ = function shell_read(filename, binary) {
     var ret;
       if (!nodeFS) nodeFS = require('fs');
       if (!nodePath) nodePath = require('path');
@@ -135,8 +145,8 @@ if (ENVIRONMENT_IS_NODE) {
     return binary ? ret : ret.toString();
   };
 
-  Module['readBinary'] = function readBinary(filename) {
-    var ret = Module['read'](filename, true);
+  readBinary = function readBinary(filename) {
+    var ret = read_(filename, true);
     if (!ret.buffer) {
       ret = new Uint8Array(ret);
     }
@@ -145,10 +155,10 @@ if (ENVIRONMENT_IS_NODE) {
   };
 
   if (process['argv'].length > 1) {
-    Module['thisProgram'] = process['argv'][1].replace(/\\/g, '/');
+    thisProgram = process['argv'][1].replace(/\\/g, '/');
   }
 
-  Module['arguments'] = process['argv'].slice(2);
+  arguments_ = process['argv'].slice(2);
 
   // MODULARIZE will export the module in the proper place outside, we don't need to export here
 
@@ -158,11 +168,10 @@ if (ENVIRONMENT_IS_NODE) {
       throw ex;
     }
   });
-  // Currently node will swallow unhandled rejections, but this behavior is
-  // deprecated, and in the future it will exit with error status.
+
   process['on']('unhandledRejection', abort);
 
-  Module['quit'] = function(status) {
+  quit_ = function(status) {
     process['exit'](status);
   };
 
@@ -172,12 +181,12 @@ if (ENVIRONMENT_IS_SHELL) {
 
 
   if (typeof read != 'undefined') {
-    Module['read'] = function shell_read(f) {
+    read_ = function shell_read(f) {
       return read(f);
     };
   }
 
-  Module['readBinary'] = function readBinary(f) {
+  readBinary = function readBinary(f) {
     var data;
     if (typeof readbuffer === 'function') {
       return new Uint8Array(readbuffer(f));
@@ -188,15 +197,22 @@ if (ENVIRONMENT_IS_SHELL) {
   };
 
   if (typeof scriptArgs != 'undefined') {
-    Module['arguments'] = scriptArgs;
+    arguments_ = scriptArgs;
   } else if (typeof arguments != 'undefined') {
-    Module['arguments'] = arguments;
+    arguments_ = arguments;
   }
 
   if (typeof quit === 'function') {
-    Module['quit'] = function(status) {
+    quit_ = function(status) {
       quit(status);
-    }
+    };
+  }
+
+  if (typeof print !== 'undefined') {
+    // Prefer to use print/printErr where they exist, as they usually work better.
+    if (typeof console === 'undefined') console = {};
+    console.log = print;
+    console.warn = console.error = typeof printErr !== 'undefined' ? printErr : print;
   }
 } else
 if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
@@ -221,7 +237,7 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
   }
 
 
-  Module['read'] = function shell_read(url) {
+  read_ = function shell_read(url) {
       var xhr = new XMLHttpRequest();
       xhr.open('GET', url, false);
       xhr.send(null);
@@ -229,7 +245,7 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
   };
 
   if (ENVIRONMENT_IS_WORKER) {
-    Module['readBinary'] = function readBinary(url) {
+    readBinary = function readBinary(url) {
         var xhr = new XMLHttpRequest();
         xhr.open('GET', url, false);
         xhr.responseType = 'arraybuffer';
@@ -238,7 +254,7 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
     };
   }
 
-  Module['readAsync'] = function readAsync(url, onload, onerror) {
+  readAsync = function readAsync(url, onload, onerror) {
     var xhr = new XMLHttpRequest();
     xhr.open('GET', url, true);
     xhr.responseType = 'arraybuffer';
@@ -253,19 +269,15 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
     xhr.send(null);
   };
 
-  Module['setWindowTitle'] = function(title) { document.title = title };
+  setWindowTitle = function(title) { document.title = title };
 } else
 {
 }
 
 // Set up the out() and err() hooks, which are how we can print to stdout or
 // stderr, respectively.
-// If the user provided Module.print or printErr, use that. Otherwise,
-// console.log is checked first, as 'print' on the web will open a print dialogue
-// printErr is preferable to console.warn (works better in shells)
-// bind(console) is necessary to fix IE/Edge closed dev tools panel behavior.
-var out = Module['print'] || (typeof console !== 'undefined' ? console.log.bind(console) : (typeof print !== 'undefined' ? print : null));
-var err = Module['printErr'] || (typeof printErr !== 'undefined' ? printErr : ((typeof console !== 'undefined' && console.warn.bind(console)) || out));
+var out = Module['print'] || console.log.bind(console);
+var err = Module['printErr'] || console.warn.bind(console);
 
 // Merge back in the overrides
 for (key in moduleOverrides) {
@@ -275,9 +287,19 @@ for (key in moduleOverrides) {
 }
 // Free the object hierarchy contained in the overrides, this lets the GC
 // reclaim data used e.g. in memoryInitializerRequest, which is a large typed array.
-moduleOverrides = undefined;
+moduleOverrides = null;
+
+// Emit code to handle expected values on the Module object. This applies Module.x
+// to the proper local x. This has two benefits: first, we only emit it if it is
+// expected to arrive, and second, by using a local everywhere else that can be
+// minified.
+if (Module['arguments']) arguments_ = Module['arguments'];
+if (Module['thisProgram']) thisProgram = Module['thisProgram'];
+if (Module['quit']) quit_ = Module['quit'];
 
 // perform assertions in shell.js after we set up out() and err(), as otherwise if an assertion fails it cannot print the message
+
+// TODO remove when SDL2 is fixed (also see above)
 
 
 
@@ -294,11 +316,10 @@ var STACK_ALIGN = 16;
 function dynamicAlloc(size) {
   var ret = HEAP32[DYNAMICTOP_PTR>>2];
   var end = (ret + size + 15) & -16;
-  if (end <= _emscripten_get_heap_size()) {
-    HEAP32[DYNAMICTOP_PTR>>2] = end;
-  } else {
-    return 0;
+  if (end > _emscripten_get_heap_size()) {
+    abort();
   }
+  HEAP32[DYNAMICTOP_PTR>>2] = end;
   return ret;
 }
 
@@ -342,7 +363,6 @@ var asm2wasmImports = { // special asm2wasm imports
         return x % y;
     },
     "debugger": function() {
-        debugger;
     }
 };
 
@@ -519,11 +539,11 @@ var tempRet0 = 0;
 
 var setTempRet0 = function(value) {
   tempRet0 = value;
-}
+};
 
 var getTempRet0 = function() {
   return tempRet0;
-}
+};
 
 
 var Runtime = {
@@ -549,11 +569,33 @@ var GLOBAL_BASE = 1024;
 //    is up at http://kripken.github.io/emscripten-site/docs/api_reference/preamble.js.html
 
 
+var wasmBinary;if (Module['wasmBinary']) wasmBinary = Module['wasmBinary'];
+var noExitRuntime;if (Module['noExitRuntime']) noExitRuntime = Module['noExitRuntime'];
+
 
 if (typeof WebAssembly !== 'object') {
   err('no native wasm support detected');
 }
 
+
+// In MINIMAL_RUNTIME, setValue() and getValue() are only available when building with safe heap enabled, for heap safety checking.
+// In traditional runtime, setValue() and getValue() are always available (although their use is highly discouraged due to perf penalties)
+
+/** @type {function(number, number, string, boolean=)} */
+function setValue(ptr, value, type, noSafe) {
+  type = type || 'i8';
+  if (type.charAt(type.length-1) === '*') type = 'i32'; // pointers are 32-bit
+    switch(type) {
+      case 'i1': HEAP8[((ptr)>>0)]=value; break;
+      case 'i8': HEAP8[((ptr)>>0)]=value; break;
+      case 'i16': HEAP16[((ptr)>>1)]=value; break;
+      case 'i32': HEAP32[((ptr)>>2)]=value; break;
+      case 'i64': (tempI64 = [value>>>0,(tempDouble=value,(+(Math_abs(tempDouble))) >= 1.0 ? (tempDouble > 0.0 ? ((Math_min((+(Math_floor((tempDouble)/4294967296.0))), 4294967295.0))|0)>>>0 : (~~((+(Math_ceil((tempDouble - +(((~~(tempDouble)))>>>0))/4294967296.0)))))>>>0) : 0)],HEAP32[((ptr)>>2)]=tempI64[0],HEAP32[(((ptr)+(4))>>2)]=tempI64[1]); break;
+      case 'float': HEAPF32[((ptr)>>2)]=value; break;
+      case 'double': HEAPF64[((ptr)>>3)]=value; break;
+      default: abort('invalid type for setValue: ' + type);
+    }
+}
 
 /** @type {function(number, string, boolean=)} */
 function getValue(ptr, type, noSafe) {
@@ -571,6 +613,7 @@ function getValue(ptr, type, noSafe) {
     }
   return null;
 }
+
 
 
 
@@ -652,6 +695,7 @@ function ccall(ident, returnType, argTypes, args, opts) {
     }
   }
   var ret = func.apply(null, cArgs);
+
   ret = convertReturnValue(ret);
   if (stack !== 0) stackRestore(stack);
   return ret;
@@ -669,22 +713,6 @@ function cwrap(ident, returnType, argTypes, opts) {
   return function() {
     return ccall(ident, returnType, argTypes, arguments, opts);
   }
-}
-
-/** @type {function(number, number, string, boolean=)} */
-function setValue(ptr, value, type, noSafe) {
-  type = type || 'i8';
-  if (type.charAt(type.length-1) === '*') type = 'i32'; // pointers are 32-bit
-    switch(type) {
-      case 'i1': HEAP8[((ptr)>>0)]=value; break;
-      case 'i8': HEAP8[((ptr)>>0)]=value; break;
-      case 'i16': HEAP16[((ptr)>>1)]=value; break;
-      case 'i32': HEAP32[((ptr)>>2)]=value; break;
-      case 'i64': (tempI64 = [value>>>0,(tempDouble=value,(+(Math_abs(tempDouble))) >= 1.0 ? (tempDouble > 0.0 ? ((Math_min((+(Math_floor((tempDouble)/4294967296.0))), 4294967295.0))|0)>>>0 : (~~((+(Math_ceil((tempDouble - +(((~~(tempDouble)))>>>0))/4294967296.0)))))>>>0) : 0)],HEAP32[((ptr)>>2)]=tempI64[0],HEAP32[(((ptr)+(4))>>2)]=tempI64[1]); break;
-      case 'float': HEAPF32[((ptr)>>2)]=value; break;
-      case 'double': HEAPF64[((ptr)>>3)]=value; break;
-      default: abort('invalid type for setValue: ' + type);
-    }
 }
 
 var ALLOC_NORMAL = 0; // Tries to use _malloc()
@@ -1146,46 +1174,6 @@ function writeAsciiToMemory(str, buffer, dontAddNull) {
 
 
 
-
-function demangle(func) {
-  return func;
-}
-
-function demangleAll(text) {
-  var regex =
-    /__Z[\w\d_]+/g;
-  return text.replace(regex,
-    function(x) {
-      var y = demangle(x);
-      return x === y ? x : (y + ' [' + x + ']');
-    });
-}
-
-function jsStackTrace() {
-  var err = new Error();
-  if (!err.stack) {
-    // IE10+ special cases: It does have callstack info, but it is only populated if an Error object is thrown,
-    // so try that as a special-case.
-    try {
-      throw new Error(0);
-    } catch(e) {
-      err = e;
-    }
-    if (!err.stack) {
-      return '(no stack trace available)';
-    }
-  }
-  return err.stack.toString();
-}
-
-function stackTrace() {
-  var js = jsStackTrace();
-  if (Module['extraStackTrace']) js += '\n' + Module['extraStackTrace']();
-  return demangleAll(js);
-}
-
-
-
 // Memory management
 
 var PAGE_SIZE = 16384;
@@ -1219,24 +1207,25 @@ var HEAP,
 /** @type {Float64Array} */
   HEAPF64;
 
-function updateGlobalBufferViews() {
-  Module['HEAP8'] = HEAP8 = new Int8Array(buffer);
-  Module['HEAP16'] = HEAP16 = new Int16Array(buffer);
-  Module['HEAP32'] = HEAP32 = new Int32Array(buffer);
-  Module['HEAPU8'] = HEAPU8 = new Uint8Array(buffer);
-  Module['HEAPU16'] = HEAPU16 = new Uint16Array(buffer);
-  Module['HEAPU32'] = HEAPU32 = new Uint32Array(buffer);
-  Module['HEAPF32'] = HEAPF32 = new Float32Array(buffer);
-  Module['HEAPF64'] = HEAPF64 = new Float64Array(buffer);
+function updateGlobalBufferAndViews(buf) {
+  buffer = buf;
+  Module['HEAP8'] = HEAP8 = new Int8Array(buf);
+  Module['HEAP16'] = HEAP16 = new Int16Array(buf);
+  Module['HEAP32'] = HEAP32 = new Int32Array(buf);
+  Module['HEAPU8'] = HEAPU8 = new Uint8Array(buf);
+  Module['HEAPU16'] = HEAPU16 = new Uint16Array(buf);
+  Module['HEAPU32'] = HEAPU32 = new Uint32Array(buf);
+  Module['HEAPF32'] = HEAPF32 = new Float32Array(buf);
+  Module['HEAPF64'] = HEAPF64 = new Float64Array(buf);
 }
 
 
 var STATIC_BASE = 1024,
-    STACK_BASE = 11808,
+    STACK_BASE = 13376,
     STACKTOP = STACK_BASE,
-    STACK_MAX = 5254688,
-    DYNAMIC_BASE = 5254688,
-    DYNAMICTOP_PTR = 11776;
+    STACK_MAX = 5256256,
+    DYNAMIC_BASE = 5256256,
+    DYNAMICTOP_PTR = 13344;
 
 
 
@@ -1244,9 +1233,6 @@ var STATIC_BASE = 1024,
 var TOTAL_STACK = 5242880;
 
 var INITIAL_TOTAL_MEMORY = Module['TOTAL_MEMORY'] || 16777216;
-if (INITIAL_TOTAL_MEMORY < TOTAL_STACK) err('TOTAL_MEMORY should be larger than TOTAL_STACK, was ' + INITIAL_TOTAL_MEMORY + '! (TOTAL_STACK=' + TOTAL_STACK + ')');
-
-// Initialize the runtime's memory
 
 
 
@@ -1254,21 +1240,27 @@ if (INITIAL_TOTAL_MEMORY < TOTAL_STACK) err('TOTAL_MEMORY should be larger than 
 
 
 
-// Use a provided buffer, if there is one, or else allocate a new one
-if (Module['buffer']) {
-  buffer = Module['buffer'];
-} else {
-  // Use a WebAssembly memory where available
-  if (typeof WebAssembly === 'object' && typeof WebAssembly.Memory === 'function') {
-    wasmMemory = new WebAssembly.Memory({ 'initial': INITIAL_TOTAL_MEMORY / WASM_PAGE_SIZE, 'maximum': INITIAL_TOTAL_MEMORY / WASM_PAGE_SIZE });
-    buffer = wasmMemory.buffer;
+
+  if (Module['wasmMemory']) {
+    wasmMemory = Module['wasmMemory'];
   } else
   {
-    buffer = new ArrayBuffer(INITIAL_TOTAL_MEMORY);
+    wasmMemory = new WebAssembly.Memory({
+      'initial': INITIAL_TOTAL_MEMORY / WASM_PAGE_SIZE
+      ,
+      'maximum': INITIAL_TOTAL_MEMORY / WASM_PAGE_SIZE
+    });
   }
-}
-updateGlobalBufferViews();
 
+
+if (wasmMemory) {
+  buffer = wasmMemory.buffer;
+}
+
+// If the user provides an incorrect length, just use that length instead rather than providing the user to
+// specifically provide the memory length with Module['TOTAL_MEMORY'].
+INITIAL_TOTAL_MEMORY = buffer.byteLength;
+updateGlobalBufferAndViews(buffer);
 
 HEAP32[DYNAMICTOP_PTR>>2] = DYNAMIC_BASE;
 
@@ -1277,7 +1269,8 @@ HEAP32[DYNAMICTOP_PTR>>2] = DYNAMIC_BASE;
 
 
 
-// Endianness check (note: assumes compiler arch was little-endian)
+
+
 
 function callRuntimeCallbacks(callbacks) {
   while(callbacks.length > 0) {
@@ -1310,18 +1303,18 @@ var runtimeExited = false;
 
 
 function preRun() {
-  // compatibility - merge in anything from Module['preRun'] at this time
+
   if (Module['preRun']) {
     if (typeof Module['preRun'] == 'function') Module['preRun'] = [Module['preRun']];
     while (Module['preRun'].length) {
       addOnPreRun(Module['preRun'].shift());
     }
   }
+
   callRuntimeCallbacks(__ATPRERUN__);
 }
 
-function ensureInitRuntime() {
-  if (runtimeInitialized) return;
+function initRuntime() {
   runtimeInitialized = true;
   
   callRuntimeCallbacks(__ATINIT__);
@@ -1337,13 +1330,14 @@ function exitRuntime() {
 }
 
 function postRun() {
-  // compatibility - merge in anything from Module['postRun'] at this time
+
   if (Module['postRun']) {
     if (typeof Module['postRun'] == 'function') Module['postRun'] = [Module['postRun']];
     while (Module['postRun'].length) {
       addOnPostRun(Module['postRun'].shift());
     }
   }
+
   callRuntimeCallbacks(__ATPOSTRUN__);
 }
 
@@ -1430,16 +1424,20 @@ function getUniqueRunDependency(id) {
 
 function addRunDependency(id) {
   runDependencies++;
+
   if (Module['monitorRunDependencies']) {
     Module['monitorRunDependencies'](runDependencies);
   }
+
 }
 
 function removeRunDependency(id) {
   runDependencies--;
+
   if (Module['monitorRunDependencies']) {
     Module['monitorRunDependencies'](runDependencies);
   }
+
   if (runDependencies == 0) {
     if (runDependencyWatcher !== null) {
       clearInterval(runDependencyWatcher);
@@ -1458,6 +1456,7 @@ Module["preloadedAudios"] = {}; // maps url to audio data
 
 
 var memoryInitializer = null;
+
 
 
 
@@ -1489,11 +1488,12 @@ if (!isDataURI(wasmBinaryFile)) {
 
 function getBinary() {
   try {
-    if (Module['wasmBinary']) {
-      return new Uint8Array(Module['wasmBinary']);
+    if (wasmBinary) {
+      return new Uint8Array(wasmBinary);
     }
-    if (Module['readBinary']) {
-      return Module['readBinary'](wasmBinaryFile);
+
+    if (readBinary) {
+      return readBinary(wasmBinaryFile);
     } else {
       throw "both async and sync fetching of the wasm failed";
     }
@@ -1506,7 +1506,7 @@ function getBinary() {
 function getBinaryPromise() {
   // if we don't have the binary yet, and have the Fetch api, use that
   // in some environments, like Electron's render process, Fetch api may be present, but have a different context than expected, let's only use it on the Web
-  if (!Module['wasmBinary'] && (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) && typeof fetch === 'function') {
+  if (!wasmBinary && (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) && typeof fetch === 'function') {
     return fetch(wasmBinaryFile, { credentials: 'same-origin' }).then(function(response) {
       if (!response['ok']) {
         throw "failed to load wasm binary file at '" + wasmBinaryFile + "'";
@@ -1521,6 +1521,8 @@ function getBinaryPromise() {
     resolve(getBinary());
   });
 }
+
+
 
 // Create the wasm instance.
 // Receives the wasm imports, returns the exports.
@@ -1545,19 +1547,9 @@ function createWasm(env) {
     Module['asm'] = exports;
     removeRunDependency('wasm-instantiate');
   }
+   // we can't run yet (except in a pthread, where we have a custom sync instantiator)
   addRunDependency('wasm-instantiate');
 
-  // User shell pages can write their own Module.instantiateWasm = function(imports, successCallback) callback
-  // to manually instantiate the Wasm module themselves. This allows pages to run the instantiation parallel
-  // to any other async startup actions they are performing.
-  if (Module['instantiateWasm']) {
-    try {
-      return Module['instantiateWasm'](info, receiveInstance);
-    } catch(e) {
-      err('Module.instantiateWasm callback failed with error: ' + e);
-      return false;
-    }
-  }
 
   function receiveInstantiatedSource(output) {
     // 'output' is a WebAssemblyInstantiatedSource object which has both the module and instance.
@@ -1566,30 +1558,51 @@ function createWasm(env) {
       // When the regression is fixed, can restore the above USE_PTHREADS-enabled path.
     receiveInstance(output['instance']);
   }
+
+
   function instantiateArrayBuffer(receiver) {
-    getBinaryPromise().then(function(binary) {
+    return getBinaryPromise().then(function(binary) {
       return WebAssembly.instantiate(binary, info);
     }).then(receiver, function(reason) {
       err('failed to asynchronously prepare wasm: ' + reason);
       abort(reason);
     });
   }
+
   // Prefer streaming instantiation if available.
-  if (!Module['wasmBinary'] &&
-      typeof WebAssembly.instantiateStreaming === 'function' &&
-      !isDataURI(wasmBinaryFile) &&
-      typeof fetch === 'function') {
-    WebAssembly.instantiateStreaming(fetch(wasmBinaryFile, { credentials: 'same-origin' }), info)
-      .then(receiveInstantiatedSource, function(reason) {
-        // We expect the most common failure cause to be a bad MIME type for the binary,
-        // in which case falling back to ArrayBuffer instantiation should work.
-        err('wasm streaming compile failed: ' + reason);
-        err('falling back to ArrayBuffer instantiation');
-        instantiateArrayBuffer(receiveInstantiatedSource);
+  function instantiateAsync() {
+    if (!wasmBinary &&
+        typeof WebAssembly.instantiateStreaming === 'function' &&
+        !isDataURI(wasmBinaryFile) &&
+        typeof fetch === 'function') {
+      fetch(wasmBinaryFile, { credentials: 'same-origin' }).then(function (response) {
+        var result = WebAssembly.instantiateStreaming(response, info);
+        return result.then(receiveInstantiatedSource, function(reason) {
+            // We expect the most common failure cause to be a bad MIME type for the binary,
+            // in which case falling back to ArrayBuffer instantiation should work.
+            err('wasm streaming compile failed: ' + reason);
+            err('falling back to ArrayBuffer instantiation');
+            instantiateArrayBuffer(receiveInstantiatedSource);
+          });
       });
-  } else {
-    instantiateArrayBuffer(receiveInstantiatedSource);
+    } else {
+      return instantiateArrayBuffer(receiveInstantiatedSource);
+    }
   }
+  // User shell pages can write their own Module.instantiateWasm = function(imports, successCallback) callback
+  // to manually instantiate the Wasm module themselves. This allows pages to run the instantiation parallel
+  // to any other async startup actions they are performing.
+  if (Module['instantiateWasm']) {
+    try {
+      var exports = Module['instantiateWasm'](info, receiveInstance);
+      return exports;
+    } catch(e) {
+      err('Module.instantiateWasm callback failed with error: ' + e);
+      return false;
+    }
+  }
+
+  instantiateAsync();
   return {}; // no exports yet; we'll fill them in later
 }
 
@@ -1616,6 +1629,10 @@ Module['asm'] = function(global, env, providedBuffer) {
   var exports = createWasm(env);
   return exports;
 };
+
+// Globals used by JS i64 conversions
+var tempDouble;
+var tempI64;
 
 // === Body ===
 
@@ -1661,7 +1678,7 @@ function _emscripten_asm_const_di(code, a0) {
 
 
 
-// STATICTOP = STATIC_BASE + 10784;
+// STATICTOP = STATIC_BASE + 12352;
 /* global initializers */ /*__ATINIT__.push();*/
 
 
@@ -1672,7 +1689,7 @@ function _emscripten_asm_const_di(code, a0) {
 
 
 /* no memory initializer */
-var tempDoublePtr = 11792
+var tempDoublePtr = 13360
 
 function copyTempFloat(ptr) { // functions, because inlining this code increases code size too much
   HEAP8[tempDoublePtr] = HEAP8[ptr];
@@ -1694,6 +1711,47 @@ function copyTempDouble(ptr) {
 
 // {{PRE_LIBRARY}}
 
+
+  function demangle(func) {
+      return func;
+    }
+  Module["demangle"] = demangle;
+
+  function demangleAll(text) {
+      var regex =
+        /\b__Z[\w\d_]+/g;
+      return text.replace(regex,
+        function(x) {
+          var y = demangle(x);
+          return x === y ? x : (y + ' [' + x + ']');
+        });
+    }
+  Module["demangleAll"] = demangleAll;
+
+  function jsStackTrace() {
+      var err = new Error();
+      if (!err.stack) {
+        // IE10+ special cases: It does have callstack info, but it is only populated if an Error object is thrown,
+        // so try that as a special-case.
+        try {
+          throw new Error(0);
+        } catch(e) {
+          err = e;
+        }
+        if (!err.stack) {
+          return '(no stack trace available)';
+        }
+      }
+      return err.stack.toString();
+    }
+  Module["jsStackTrace"] = jsStackTrace;
+
+  function stackTrace() {
+      var js = jsStackTrace();
+      if (Module['extraStackTrace']) js += '\n' + Module['extraStackTrace']();
+      return demangleAll(js);
+    }
+  Module["stackTrace"] = stackTrace;
 
   
   
@@ -1866,15 +1924,6 @@ function copyTempDouble(ptr) {
     }
   Module["_emscripten_get_heap_size"] = _emscripten_get_heap_size;
 
-  
-  function abortOnCannotGrowMemory(requestedSize) {
-      abort('OOM');
-    }
-  Module["abortOnCannotGrowMemory"] = abortOnCannotGrowMemory;function _emscripten_resize_heap(requestedSize) {
-      abortOnCannotGrowMemory(requestedSize);
-    }
-  Module["_emscripten_resize_heap"] = _emscripten_resize_heap;
-
   function _gettimeofday(ptr) {
       var now = Date.now();
       HEAP32[((ptr)>>2)]=(now/1000)|0; // seconds
@@ -1902,7 +1951,16 @@ function copyTempDouble(ptr) {
       if (Module['___errno_location']) HEAP32[((Module['___errno_location']())>>2)]=value;
       return value;
     }
-  Module["___setErrNo"] = ___setErrNo; 
+  Module["___setErrNo"] = ___setErrNo;
+  
+  
+  function abortOnCannotGrowMemory(requestedSize) {
+      abort('OOM');
+    }
+  Module["abortOnCannotGrowMemory"] = abortOnCannotGrowMemory;function _emscripten_resize_heap(requestedSize) {
+      abortOnCannotGrowMemory(requestedSize);
+    }
+  Module["_emscripten_resize_heap"] = _emscripten_resize_heap; 
 var ASSERTIONS = false;
 
 // Copyright 2017 The Emscripten Authors.  All rights reserved.
@@ -1974,7 +2032,7 @@ function jsCall_vji(index,a1,a2) {
     functionPointers[index](a1,a2);
 }
 
-var asmGlobalArg = {}
+var asmGlobalArg = {};
 
 var asmLibraryArg = {
   "abort": abort,
@@ -2006,10 +2064,14 @@ var asmLibraryArg = {
   "_emscripten_resize_heap": _emscripten_resize_heap,
   "_gettimeofday": _gettimeofday,
   "abortOnCannotGrowMemory": abortOnCannotGrowMemory,
+  "demangle": demangle,
+  "demangleAll": demangleAll,
   "flush_NO_FILESYSTEM": flush_NO_FILESYSTEM,
+  "jsStackTrace": jsStackTrace,
+  "stackTrace": stackTrace,
   "tempDoublePtr": tempDoublePtr,
   "DYNAMICTOP_PTR": DYNAMICTOP_PTR
-}
+};
 // EMSCRIPTEN_START_ASM
 var asm =Module["asm"]// EMSCRIPTEN_END_ASM
 (asmGlobalArg, asmLibraryArg, buffer);
@@ -2023,36 +2085,36 @@ var _PICO_TIME_MS = Module["_PICO_TIME_MS"] = function() {
   return Module["asm"]["_PICO_TIME_MS"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_158 = Module["_PICO_TIME_MS_158"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_158"].apply(null, arguments)
+var _PICO_TIME_MS_126 = Module["_PICO_TIME_MS_126"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_126"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_205 = Module["_PICO_TIME_MS_205"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_205"].apply(null, arguments)
+var _PICO_TIME_MS_133 = Module["_PICO_TIME_MS_133"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_133"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_235 = Module["_PICO_TIME_MS_235"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_235"].apply(null, arguments)
+var _PICO_TIME_MS_142 = Module["_PICO_TIME_MS_142"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_142"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_312 = Module["_PICO_TIME_MS_312"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_312"].apply(null, arguments)
+var _PICO_TIME_MS_227 = Module["_PICO_TIME_MS_227"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_227"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_377 = Module["_PICO_TIME_MS_377"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_377"].apply(null, arguments)
+var _PICO_TIME_MS_274 = Module["_PICO_TIME_MS_274"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_274"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_382 = Module["_PICO_TIME_MS_382"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_382"].apply(null, arguments)
+var _PICO_TIME_MS_306 = Module["_PICO_TIME_MS_306"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_306"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_404 = Module["_PICO_TIME_MS_404"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_404"].apply(null, arguments)
+var _PICO_TIME_MS_362 = Module["_PICO_TIME_MS_362"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_362"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_82 = Module["_PICO_TIME_MS_82"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_82"].apply(null, arguments)
+var _PICO_TIME_MS_372 = Module["_PICO_TIME_MS_372"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_372"].apply(null, arguments)
 };
 
 var ___DOUBLE_BITS_670 = Module["___DOUBLE_BITS_670"] = function() {
@@ -2349,6 +2411,18 @@ var _discard = Module["_discard"] = function() {
 
 var _dns_ns_cmp = Module["_dns_ns_cmp"] = function() {
   return Module["asm"]["_dns_ns_cmp"].apply(null, arguments)
+};
+
+var _dns_ptr_ip6_nibble_hi = Module["_dns_ptr_ip6_nibble_hi"] = function() {
+  return Module["asm"]["_dns_ptr_ip6_nibble_hi"].apply(null, arguments)
+};
+
+var _dns_ptr_ip6_nibble_lo = Module["_dns_ptr_ip6_nibble_lo"] = function() {
+  return Module["asm"]["_dns_ptr_ip6_nibble_lo"].apply(null, arguments)
+};
+
+var _dns_query_cmp = Module["_dns_query_cmp"] = function() {
+  return Module["asm"]["_dns_query_cmp"].apply(null, arguments)
 };
 
 var _do_enqueue_segment = Module["_do_enqueue_segment"] = function() {
@@ -2659,6 +2733,10 @@ var _isdigit = Module["_isdigit"] = function() {
   return Module["asm"]["_isdigit"].apply(null, arguments)
 };
 
+var _isupper = Module["_isupper"] = function() {
+  return Module["asm"]["_isupper"].apply(null, arguments)
+};
+
 var _js_add_ipv4 = Module["_js_add_ipv4"] = function() {
   return Module["asm"]["_js_add_ipv4"].apply(null, arguments)
 };
@@ -2699,52 +2777,60 @@ var _long_be = Module["_long_be"] = function() {
   return Module["asm"]["_long_be"].apply(null, arguments)
 };
 
-var _long_be_236 = Module["_long_be_236"] = function() {
-  return Module["asm"]["_long_be_236"].apply(null, arguments)
+var _long_be_129 = Module["_long_be_129"] = function() {
+  return Module["asm"]["_long_be_129"].apply(null, arguments)
 };
 
-var _long_be_283 = Module["_long_be_283"] = function() {
-  return Module["asm"]["_long_be_283"].apply(null, arguments)
+var _long_be_143 = Module["_long_be_143"] = function() {
+  return Module["asm"]["_long_be_143"].apply(null, arguments)
 };
 
-var _long_be_290 = Module["_long_be_290"] = function() {
-  return Module["asm"]["_long_be_290"].apply(null, arguments)
+var _long_be_158 = Module["_long_be_158"] = function() {
+  return Module["asm"]["_long_be_158"].apply(null, arguments)
 };
 
-var _long_be_314 = Module["_long_be_314"] = function() {
-  return Module["asm"]["_long_be_314"].apply(null, arguments)
+var _long_be_307 = Module["_long_be_307"] = function() {
+  return Module["asm"]["_long_be_307"].apply(null, arguments)
+};
+
+var _long_be_325 = Module["_long_be_325"] = function() {
+  return Module["asm"]["_long_be_325"].apply(null, arguments)
+};
+
+var _long_be_336 = Module["_long_be_336"] = function() {
+  return Module["asm"]["_long_be_336"].apply(null, arguments)
 };
 
 var _long_be_35 = Module["_long_be_35"] = function() {
   return Module["asm"]["_long_be_35"].apply(null, arguments)
 };
 
-var _long_be_387 = Module["_long_be_387"] = function() {
-  return Module["asm"]["_long_be_387"].apply(null, arguments)
+var _long_be_364 = Module["_long_be_364"] = function() {
+  return Module["asm"]["_long_be_364"].apply(null, arguments)
 };
 
-var _long_be_40 = Module["_long_be_40"] = function() {
-  return Module["asm"]["_long_be_40"].apply(null, arguments)
+var _long_be_37 = Module["_long_be_37"] = function() {
+  return Module["asm"]["_long_be_37"].apply(null, arguments)
 };
 
-var _long_be_400 = Module["_long_be_400"] = function() {
-  return Module["asm"]["_long_be_400"].apply(null, arguments)
+var _long_be_377 = Module["_long_be_377"] = function() {
+  return Module["asm"]["_long_be_377"].apply(null, arguments)
 };
 
-var _long_be_83 = Module["_long_be_83"] = function() {
-  return Module["asm"]["_long_be_83"].apply(null, arguments)
-};
-
-var _long_be_95 = Module["_long_be_95"] = function() {
-  return Module["asm"]["_long_be_95"].apply(null, arguments)
+var _long_be_65 = Module["_long_be_65"] = function() {
+  return Module["asm"]["_long_be_65"].apply(null, arguments)
 };
 
 var _long_from = Module["_long_from"] = function() {
   return Module["asm"]["_long_from"].apply(null, arguments)
 };
 
-var _long_from_88 = Module["_long_from_88"] = function() {
-  return Module["asm"]["_long_from_88"].apply(null, arguments)
+var _long_from_148 = Module["_long_from_148"] = function() {
+  return Module["asm"]["_long_from_148"].apply(null, arguments)
+};
+
+var _long_from_85 = Module["_long_from_85"] = function() {
+  return Module["asm"]["_long_from_85"].apply(null, arguments)
 };
 
 var _main = Module["_main"] = function() {
@@ -2983,8 +3069,8 @@ var _next_segment = Module["_next_segment"] = function() {
   return Module["asm"]["_next_segment"].apply(null, arguments)
 };
 
-var _out_29 = Module["_out_29"] = function() {
-  return Module["asm"]["_out_29"].apply(null, arguments)
+var _out_8 = Module["_out_8"] = function() {
+  return Module["asm"]["_out_8"].apply(null, arguments)
 };
 
 var _pad_667 = Module["_pad_667"] = function() {
@@ -3151,16 +3237,16 @@ var _pico_dequeue = Module["_pico_dequeue"] = function() {
   return Module["asm"]["_pico_dequeue"].apply(null, arguments)
 };
 
-var _pico_dequeue_119 = Module["_pico_dequeue_119"] = function() {
-  return Module["asm"]["_pico_dequeue_119"].apply(null, arguments)
+var _pico_dequeue_162 = Module["_pico_dequeue_162"] = function() {
+  return Module["asm"]["_pico_dequeue_162"].apply(null, arguments)
 };
 
-var _pico_dequeue_440 = Module["_pico_dequeue_440"] = function() {
-  return Module["asm"]["_pico_dequeue_440"].apply(null, arguments)
+var _pico_dequeue_186 = Module["_pico_dequeue_186"] = function() {
+  return Module["asm"]["_pico_dequeue_186"].apply(null, arguments)
 };
 
-var _pico_dequeue_99 = Module["_pico_dequeue_99"] = function() {
-  return Module["asm"]["_pico_dequeue_99"].apply(null, arguments)
+var _pico_dequeue_418 = Module["_pico_dequeue_418"] = function() {
+  return Module["asm"]["_pico_dequeue_418"].apply(null, arguments)
 };
 
 var _pico_dev_cmp = Module["_pico_dev_cmp"] = function() {
@@ -3363,12 +3449,76 @@ var _pico_discard_segment = Module["_pico_discard_segment"] = function() {
   return Module["asm"]["_pico_discard_segment"].apply(null, arguments)
 };
 
+var _pico_dns_check_namelen = Module["_pico_dns_check_namelen"] = function() {
+  return Module["asm"]["_pico_dns_check_namelen"].apply(null, arguments)
+};
+
 var _pico_dns_client_add_ns = Module["_pico_dns_client_add_ns"] = function() {
   return Module["asm"]["_pico_dns_client_add_ns"].apply(null, arguments)
 };
 
+var _pico_dns_client_add_query = Module["_pico_dns_client_add_query"] = function() {
+  return Module["asm"]["_pico_dns_client_add_query"].apply(null, arguments)
+};
+
+var _pico_dns_client_addr_label_check_len = Module["_pico_dns_client_addr_label_check_len"] = function() {
+  return Module["asm"]["_pico_dns_client_addr_label_check_len"].apply(null, arguments)
+};
+
+var _pico_dns_client_callback = Module["_pico_dns_client_callback"] = function() {
+  return Module["asm"]["_pico_dns_client_callback"].apply(null, arguments)
+};
+
+var _pico_dns_client_check_asuffix = Module["_pico_dns_client_check_asuffix"] = function() {
+  return Module["asm"]["_pico_dns_client_check_asuffix"].apply(null, arguments)
+};
+
+var _pico_dns_client_check_header = Module["_pico_dns_client_check_header"] = function() {
+  return Module["asm"]["_pico_dns_client_check_header"].apply(null, arguments)
+};
+
+var _pico_dns_client_check_qsuffix = Module["_pico_dns_client_check_qsuffix"] = function() {
+  return Module["asm"]["_pico_dns_client_check_qsuffix"].apply(null, arguments)
+};
+
+var _pico_dns_client_check_rdlength = Module["_pico_dns_client_check_rdlength"] = function() {
+  return Module["asm"]["_pico_dns_client_check_rdlength"].apply(null, arguments)
+};
+
+var _pico_dns_client_check_url = Module["_pico_dns_client_check_url"] = function() {
+  return Module["asm"]["_pico_dns_client_check_url"].apply(null, arguments)
+};
+
 var _pico_dns_client_del_ns = Module["_pico_dns_client_del_ns"] = function() {
   return Module["asm"]["_pico_dns_client_del_ns"].apply(null, arguments)
+};
+
+var _pico_dns_client_del_query = Module["_pico_dns_client_del_query"] = function() {
+  return Module["asm"]["_pico_dns_client_del_query"].apply(null, arguments)
+};
+
+var _pico_dns_client_find_query = Module["_pico_dns_client_find_query"] = function() {
+  return Module["asm"]["_pico_dns_client_find_query"].apply(null, arguments)
+};
+
+var _pico_dns_client_getaddr = Module["_pico_dns_client_getaddr"] = function() {
+  return Module["asm"]["_pico_dns_client_getaddr"].apply(null, arguments)
+};
+
+var _pico_dns_client_getaddr_check = Module["_pico_dns_client_getaddr_check"] = function() {
+  return Module["asm"]["_pico_dns_client_getaddr_check"].apply(null, arguments)
+};
+
+var _pico_dns_client_getaddr_init = Module["_pico_dns_client_getaddr_init"] = function() {
+  return Module["asm"]["_pico_dns_client_getaddr_init"].apply(null, arguments)
+};
+
+var _pico_dns_client_getname = Module["_pico_dns_client_getname"] = function() {
+  return Module["asm"]["_pico_dns_client_getname"].apply(null, arguments)
+};
+
+var _pico_dns_client_idcheck = Module["_pico_dns_client_idcheck"] = function() {
+  return Module["asm"]["_pico_dns_client_idcheck"].apply(null, arguments)
 };
 
 var _pico_dns_client_init = Module["_pico_dns_client_init"] = function() {
@@ -3377,6 +3527,78 @@ var _pico_dns_client_init = Module["_pico_dns_client_init"] = function() {
 
 var _pico_dns_client_nameserver = Module["_pico_dns_client_nameserver"] = function() {
   return Module["asm"]["_pico_dns_client_nameserver"].apply(null, arguments)
+};
+
+var _pico_dns_client_next_ns = Module["_pico_dns_client_next_ns"] = function() {
+  return Module["asm"]["_pico_dns_client_next_ns"].apply(null, arguments)
+};
+
+var _pico_dns_client_query_header = Module["_pico_dns_client_query_header"] = function() {
+  return Module["asm"]["_pico_dns_client_query_header"].apply(null, arguments)
+};
+
+var _pico_dns_client_retransmission = Module["_pico_dns_client_retransmission"] = function() {
+  return Module["asm"]["_pico_dns_client_retransmission"].apply(null, arguments)
+};
+
+var _pico_dns_client_seek = Module["_pico_dns_client_seek"] = function() {
+  return Module["asm"]["_pico_dns_client_seek"].apply(null, arguments)
+};
+
+var _pico_dns_client_seek_suffix = Module["_pico_dns_client_seek_suffix"] = function() {
+  return Module["asm"]["_pico_dns_client_seek_suffix"].apply(null, arguments)
+};
+
+var _pico_dns_client_send = Module["_pico_dns_client_send"] = function() {
+  return Module["asm"]["_pico_dns_client_send"].apply(null, arguments)
+};
+
+var _pico_dns_client_user_callback = Module["_pico_dns_client_user_callback"] = function() {
+  return Module["asm"]["_pico_dns_client_user_callback"].apply(null, arguments)
+};
+
+var _pico_dns_create_message = Module["_pico_dns_create_message"] = function() {
+  return Module["asm"]["_pico_dns_create_message"].apply(null, arguments)
+};
+
+var _pico_dns_decompress_name = Module["_pico_dns_decompress_name"] = function() {
+  return Module["asm"]["_pico_dns_decompress_name"].apply(null, arguments)
+};
+
+var _pico_dns_fill_packet_header = Module["_pico_dns_fill_packet_header"] = function() {
+  return Module["asm"]["_pico_dns_fill_packet_header"].apply(null, arguments)
+};
+
+var _pico_dns_getname_univ = Module["_pico_dns_getname_univ"] = function() {
+  return Module["asm"]["_pico_dns_getname_univ"].apply(null, arguments)
+};
+
+var _pico_dns_ipv6_set_ptr = Module["_pico_dns_ipv6_set_ptr"] = function() {
+  return Module["asm"]["_pico_dns_ipv6_set_ptr"].apply(null, arguments)
+};
+
+var _pico_dns_mirror_addr = Module["_pico_dns_mirror_addr"] = function() {
+  return Module["asm"]["_pico_dns_mirror_addr"].apply(null, arguments)
+};
+
+var _pico_dns_name_to_dns_notation = Module["_pico_dns_name_to_dns_notation"] = function() {
+  return Module["asm"]["_pico_dns_name_to_dns_notation"].apply(null, arguments)
+};
+
+var _pico_dns_notation_to_name = Module["_pico_dns_notation_to_name"] = function() {
+  return Module["asm"]["_pico_dns_notation_to_name"].apply(null, arguments)
+};
+
+var _pico_dns_question_fill_suffix = Module["_pico_dns_question_fill_suffix"] = function() {
+  return Module["asm"]["_pico_dns_question_fill_suffix"].apply(null, arguments)
+};
+
+var _pico_dns_strlen = Module["_pico_dns_strlen"] = function() {
+  return Module["asm"]["_pico_dns_strlen"].apply(null, arguments)
+};
+
+var _pico_dns_try_fallback_cname = Module["_pico_dns_try_fallback_cname"] = function() {
+  return Module["asm"]["_pico_dns_try_fallback_cname"].apply(null, arguments)
 };
 
 var _pico_dualbuffer_checksum = Module["_pico_dualbuffer_checksum"] = function() {
@@ -3391,28 +3613,28 @@ var _pico_enqueue = Module["_pico_enqueue"] = function() {
   return Module["asm"]["_pico_enqueue"].apply(null, arguments)
 };
 
-var _pico_enqueue_184 = Module["_pico_enqueue_184"] = function() {
-  return Module["asm"]["_pico_enqueue_184"].apply(null, arguments)
+var _pico_enqueue_107 = Module["_pico_enqueue_107"] = function() {
+  return Module["asm"]["_pico_enqueue_107"].apply(null, arguments)
 };
 
-var _pico_enqueue_280 = Module["_pico_enqueue_280"] = function() {
-  return Module["asm"]["_pico_enqueue_280"].apply(null, arguments)
+var _pico_enqueue_147 = Module["_pico_enqueue_147"] = function() {
+  return Module["asm"]["_pico_enqueue_147"].apply(null, arguments)
 };
 
-var _pico_enqueue_332 = Module["_pico_enqueue_332"] = function() {
-  return Module["asm"]["_pico_enqueue_332"].apply(null, arguments)
+var _pico_enqueue_153 = Module["_pico_enqueue_153"] = function() {
+  return Module["asm"]["_pico_enqueue_153"].apply(null, arguments)
 };
 
-var _pico_enqueue_433 = Module["_pico_enqueue_433"] = function() {
-  return Module["asm"]["_pico_enqueue_433"].apply(null, arguments)
+var _pico_enqueue_253 = Module["_pico_enqueue_253"] = function() {
+  return Module["asm"]["_pico_enqueue_253"].apply(null, arguments)
 };
 
-var _pico_enqueue_87 = Module["_pico_enqueue_87"] = function() {
-  return Module["asm"]["_pico_enqueue_87"].apply(null, arguments)
+var _pico_enqueue_322 = Module["_pico_enqueue_322"] = function() {
+  return Module["asm"]["_pico_enqueue_322"].apply(null, arguments)
 };
 
-var _pico_enqueue_92 = Module["_pico_enqueue_92"] = function() {
-  return Module["asm"]["_pico_enqueue_92"].apply(null, arguments)
+var _pico_enqueue_411 = Module["_pico_enqueue_411"] = function() {
+  return Module["asm"]["_pico_enqueue_411"].apply(null, arguments)
 };
 
 var _pico_enqueue_and_wakeup_if_needed = Module["_pico_enqueue_and_wakeup_if_needed"] = function() {
@@ -3567,8 +3789,8 @@ var _pico_hash = Module["_pico_hash"] = function() {
   return Module["asm"]["_pico_hash"].apply(null, arguments)
 };
 
-var _pico_hash_449 = Module["_pico_hash_449"] = function() {
-  return Module["asm"]["_pico_hash_449"].apply(null, arguments)
+var _pico_hash_427 = Module["_pico_hash_427"] = function() {
+  return Module["asm"]["_pico_hash_427"].apply(null, arguments)
 };
 
 var _pico_hold_segment_make = Module["_pico_hold_segment_make"] = function() {
@@ -4647,8 +4869,8 @@ var _pico_queue_peek = Module["_pico_queue_peek"] = function() {
   return Module["asm"]["_pico_queue_peek"].apply(null, arguments)
 };
 
-var _pico_queue_peek_100 = Module["_pico_queue_peek_100"] = function() {
-  return Module["asm"]["_pico_queue_peek_100"].apply(null, arguments)
+var _pico_queue_peek_163 = Module["_pico_queue_peek_163"] = function() {
+  return Module["asm"]["_pico_queue_peek_163"].apply(null, arguments)
 };
 
 var _pico_rand = Module["_pico_rand"] = function() {
@@ -4773,6 +4995,10 @@ var _pico_socket_recvfrom = Module["_pico_socket_recvfrom"] = function() {
 
 var _pico_socket_recvfrom_extended = Module["_pico_socket_recvfrom_extended"] = function() {
   return Module["asm"]["_pico_socket_recvfrom_extended"].apply(null, arguments)
+};
+
+var _pico_socket_send = Module["_pico_socket_send"] = function() {
+  return Module["asm"]["_pico_socket_send"].apply(null, arguments)
 };
 
 var _pico_socket_sendto = Module["_pico_socket_sendto"] = function() {
@@ -5355,36 +5581,44 @@ var _short_be_1 = Module["_short_be_1"] = function() {
   return Module["asm"]["_short_be_1"].apply(null, arguments)
 };
 
-var _short_be_107 = Module["_short_be_107"] = function() {
-  return Module["asm"]["_short_be_107"].apply(null, arguments)
+var _short_be_108 = Module["_short_be_108"] = function() {
+  return Module["asm"]["_short_be_108"].apply(null, arguments)
 };
 
-var _short_be_138 = Module["_short_be_138"] = function() {
-  return Module["asm"]["_short_be_138"].apply(null, arguments)
+var _short_be_136 = Module["_short_be_136"] = function() {
+  return Module["asm"]["_short_be_136"].apply(null, arguments)
 };
 
-var _short_be_234 = Module["_short_be_234"] = function() {
-  return Module["asm"]["_short_be_234"].apply(null, arguments)
+var _short_be_139 = Module["_short_be_139"] = function() {
+  return Module["asm"]["_short_be_139"].apply(null, arguments)
 };
 
-var _short_be_288 = Module["_short_be_288"] = function() {
-  return Module["asm"]["_short_be_288"].apply(null, arguments)
+var _short_be_146 = Module["_short_be_146"] = function() {
+  return Module["asm"]["_short_be_146"].apply(null, arguments)
+};
+
+var _short_be_152 = Module["_short_be_152"] = function() {
+  return Module["asm"]["_short_be_152"].apply(null, arguments)
+};
+
+var _short_be_174 = Module["_short_be_174"] = function() {
+  return Module["asm"]["_short_be_174"].apply(null, arguments)
+};
+
+var _short_be_205 = Module["_short_be_205"] = function() {
+  return Module["asm"]["_short_be_205"].apply(null, arguments)
+};
+
+var _short_be_305 = Module["_short_be_305"] = function() {
+  return Module["asm"]["_short_be_305"].apply(null, arguments)
 };
 
 var _short_be_31 = Module["_short_be_31"] = function() {
   return Module["asm"]["_short_be_31"].apply(null, arguments)
 };
 
-var _short_be_313 = Module["_short_be_313"] = function() {
-  return Module["asm"]["_short_be_313"].apply(null, arguments)
-};
-
-var _short_be_319 = Module["_short_be_319"] = function() {
-  return Module["asm"]["_short_be_319"].apply(null, arguments)
-};
-
-var _short_be_333 = Module["_short_be_333"] = function() {
-  return Module["asm"]["_short_be_333"].apply(null, arguments)
+var _short_be_332 = Module["_short_be_332"] = function() {
+  return Module["asm"]["_short_be_332"].apply(null, arguments)
 };
 
 var _short_be_34 = Module["_short_be_34"] = function() {
@@ -5395,28 +5629,32 @@ var _short_be_36 = Module["_short_be_36"] = function() {
   return Module["asm"]["_short_be_36"].apply(null, arguments)
 };
 
-var _short_be_407 = Module["_short_be_407"] = function() {
-  return Module["asm"]["_short_be_407"].apply(null, arguments)
+var _short_be_363 = Module["_short_be_363"] = function() {
+  return Module["asm"]["_short_be_363"].apply(null, arguments)
 };
 
-var _short_be_43 = Module["_short_be_43"] = function() {
-  return Module["asm"]["_short_be_43"].apply(null, arguments)
+var _short_be_369 = Module["_short_be_369"] = function() {
+  return Module["asm"]["_short_be_369"].apply(null, arguments)
 };
 
-var _short_be_79 = Module["_short_be_79"] = function() {
-  return Module["asm"]["_short_be_79"].apply(null, arguments)
+var _short_be_55 = Module["_short_be_55"] = function() {
+  return Module["asm"]["_short_be_55"].apply(null, arguments)
 };
 
-var _short_be_86 = Module["_short_be_86"] = function() {
-  return Module["asm"]["_short_be_86"].apply(null, arguments)
+var _short_be_61 = Module["_short_be_61"] = function() {
+  return Module["asm"]["_short_be_61"].apply(null, arguments)
 };
 
-var _short_be_91 = Module["_short_be_91"] = function() {
-  return Module["asm"]["_short_be_91"].apply(null, arguments)
+var _short_be_70 = Module["_short_be_70"] = function() {
+  return Module["asm"]["_short_be_70"].apply(null, arguments)
 };
 
 var _short_from = Module["_short_from"] = function() {
   return Module["asm"]["_short_from"].apply(null, arguments)
+};
+
+var _short_from_149 = Module["_short_from_149"] = function() {
+  return Module["asm"]["_short_from_149"].apply(null, arguments)
 };
 
 var _slifs = Module["_slifs"] = function() {
@@ -5489,6 +5727,10 @@ var _st = Module["_st"] = function() {
 
 var _stcl = Module["_stcl"] = function() {
   return Module["asm"]["_stcl"].apply(null, arguments)
+};
+
+var _strcasecmp = Module["_strcasecmp"] = function() {
+  return Module["asm"]["_strcasecmp"].apply(null, arguments)
 };
 
 var _strcmp = Module["_strcmp"] = function() {
@@ -5807,6 +6049,10 @@ var _time_diff = Module["_time_diff"] = function() {
   return Module["asm"]["_time_diff"].apply(null, arguments)
 };
 
+var _tolower = Module["_tolower"] = function() {
+  return Module["asm"]["_tolower"].apply(null, arguments)
+};
+
 var _transport_flags_update = Module["_transport_flags_update"] = function() {
   return Module["asm"]["_transport_flags_update"].apply(null, arguments)
 };
@@ -5937,7 +6183,6 @@ Module["cwrap"] = cwrap;
 
 
 
-
 Module["addFunction"] = addFunction;
 Module["removeFunction"] = removeFunction;
 
@@ -5960,6 +6205,11 @@ Module["removeFunction"] = removeFunction;
 
 
 
+
+
+
+var calledRun;
+
 // Modularize mode returns a function, which can be called to
 // create instances. The instances provide a then() method,
 // must like a Promise, that receives a callback. The callback
@@ -5969,7 +6219,7 @@ Module["removeFunction"] = removeFunction;
 Module['then'] = function(func) {
   // We may already be ready to run code at this time. if
   // so, just queue a call to the callback.
-  if (Module['calledRun']) {
+  if (calledRun) {
     func(Module);
   } else {
     // we are not ready to call then() yet. we must call it
@@ -5985,34 +6235,30 @@ Module['then'] = function(func) {
 
 /**
  * @constructor
- * @extends {Error}
  * @this {ExitStatus}
  */
 function ExitStatus(status) {
   this.name = "ExitStatus";
   this.message = "Program terminated with exit(" + status + ")";
   this.status = status;
-};
-ExitStatus.prototype = new Error();
-ExitStatus.prototype.constructor = ExitStatus;
+}
 
 var calledMain = false;
 
 dependenciesFulfilled = function runCaller() {
   // If run has never been called, and we should call run (INVOKE_RUN is true, and Module.noInitialRun is not false)
-  if (!Module['calledRun']) run();
-  if (!Module['calledRun']) dependenciesFulfilled = runCaller; // try this again later, after new deps are fulfilled
-}
+  if (!calledRun) run();
+  if (!calledRun) dependenciesFulfilled = runCaller; // try this again later, after new deps are fulfilled
+};
 
-Module['callMain'] = function callMain(args) {
+function callMain(args) {
+
 
   args = args || [];
 
-  ensureInitRuntime();
-
   var argc = args.length+1;
   var argv = stackAlloc((argc + 1) * 4);
-  HEAP32[argv >> 2] = allocateUTF8OnStack(Module['thisProgram']);
+  HEAP32[argv >> 2] = allocateUTF8OnStack(thisProgram);
   for (var i = 1; i < argc; i++) {
     HEAP32[(argv >> 2) + i] = allocateUTF8OnStack(args[i - 1]);
   }
@@ -6021,7 +6267,8 @@ Module['callMain'] = function callMain(args) {
 
   try {
 
-    var ret = Module['_main'](argc, argv, 0);
+
+    var ret = Module['_main'](argc, argv);
 
 
     // if we're not running an evented main loop, it's time to exit
@@ -6034,7 +6281,7 @@ Module['callMain'] = function callMain(args) {
       return;
     } else if (e == 'SimulateInfiniteLoop') {
       // running an evented main loop, don't immediately exit
-      Module['noExitRuntime'] = true;
+      noExitRuntime = true;
       return;
     } else {
       var toLog = e;
@@ -6042,7 +6289,7 @@ Module['callMain'] = function callMain(args) {
         toLog = [e, e.stack];
       }
       err('exception thrown: ' + toLog);
-      Module['quit'](1, e);
+      quit_(1, e);
     }
   } finally {
     calledMain = true;
@@ -6054,7 +6301,7 @@ Module['callMain'] = function callMain(args) {
 
 /** @type {function(Array=)} */
 function run(args) {
-  args = args || Module['arguments'];
+  args = args || arguments_;
 
   if (runDependencies > 0) {
     return;
@@ -6064,21 +6311,22 @@ function run(args) {
   preRun();
 
   if (runDependencies > 0) return; // a preRun added a dependency, run will be called later
-  if (Module['calledRun']) return; // run may have just been called through dependencies being fulfilled just in this very frame
 
   function doRun() {
-    if (Module['calledRun']) return; // run may have just been called while the async setStatus time below was happening
-    Module['calledRun'] = true;
+    // run may have just been called through dependencies being fulfilled just in this very frame,
+    // or while the async setStatus time below was happening
+    if (calledRun) return;
+    calledRun = true;
 
     if (ABORT) return;
 
-    ensureInitRuntime();
+    initRuntime();
 
     preMain();
 
     if (Module['onRuntimeInitialized']) Module['onRuntimeInitialized']();
 
-    if (Module['_main'] && shouldRunNow) Module['callMain'](args);
+    if (shouldRunNow) callMain(args);
 
     postRun();
   }
@@ -6091,7 +6339,8 @@ function run(args) {
       }, 1);
       doRun();
     }, 1);
-  } else {
+  } else
+  {
     doRun();
   }
 }
@@ -6104,11 +6353,11 @@ function exit(status, implicit) {
   // don't need to do anything here and can just leave. if the status is
   // non-zero, though, then we need to report it.
   // (we may have warned about this earlier, if a situation justifies doing so)
-  if (implicit && Module['noExitRuntime'] && status === 0) {
+  if (implicit && noExitRuntime && status === 0) {
     return;
   }
 
-  if (Module['noExitRuntime']) {
+  if (noExitRuntime) {
   } else {
 
     ABORT = true;
@@ -6119,7 +6368,7 @@ function exit(status, implicit) {
     if (Module['onExit']) Module['onExit'](status);
   }
 
-  Module['quit'](status, new ExitStatus(status));
+  quit_(status, new ExitStatus(status));
 }
 
 var abortDecorators = [];
@@ -6129,13 +6378,9 @@ function abort(what) {
     Module['onAbort'](what);
   }
 
-  if (what !== undefined) {
-    out(what);
-    err(what);
-    what = JSON.stringify(what)
-  } else {
-    what = '';
-  }
+  what += '';
+  out(what);
+  err(what);
 
   ABORT = true;
   EXITSTATUS = 1;
@@ -6153,11 +6398,11 @@ if (Module['preInit']) {
 
 // shouldRunNow refers to calling main(), not run().
 var shouldRunNow = true;
-if (Module['noInitialRun']) {
-  shouldRunNow = false;
-}
 
-  Module["noExitRuntime"] = true;
+if (Module['noInitialRun']) shouldRunNow = false;
+
+
+  noExitRuntime = true;
 
 run();
 
