@@ -4,6 +4,8 @@
 #include "pico_icmp4.h"
 #include "pico_device.h"
 #include "pico_socket.h"
+#include "pico_dhcp_client.h"
+#include "pico_dns_client.h"
 #include <emscripten.h>
 
 static int pico_js_send(struct pico_device *dev, void *buf, int len) {
@@ -176,6 +178,11 @@ int js_add_ipv4(struct pico_device *dev, char *ip, char *net) {
     pico_string_to_ipv4(ip, &ipaddr.addr);
     pico_string_to_ipv4(net, &netmask.addr);
     return pico_ipv4_link_add(dev, ipaddr, netmask);
+}
+
+int EMSCRIPTEN_KEEPALIVE js_accept_nameserver(void *cli) {
+    struct pico_ip4 nameserver_ip = pico_dhcp_get_nameserver(cli, 0);
+    return pico_dns_client_nameserver(&nameserver_ip, PICO_DNS_NS_ADD);
 }
 
 int main(void){
