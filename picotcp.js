@@ -105,13 +105,6 @@ ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIRONME
 
 
 
-// Three configurations we can be running in:
-// 1) We could be the application main() thread running in the main JS UI thread. (ENVIRONMENT_IS_WORKER == false and ENVIRONMENT_IS_PTHREAD == false)
-// 2) We could be the application main() thread proxied to worker. (with Emscripten -s PROXY_TO_WORKER=1) (ENVIRONMENT_IS_WORKER == true, ENVIRONMENT_IS_PTHREAD == false)
-// 3) We could be an application pthread running in a worker. (ENVIRONMENT_IS_WORKER == true and ENVIRONMENT_IS_PTHREAD == true)
-
-
-
 
 // `/` should be present at the end if `scriptDirectory` is not empty
 var scriptDirectory = '';
@@ -128,21 +121,19 @@ var read_,
     readBinary,
     setWindowTitle;
 
+var nodeFS;
+var nodePath;
+
 if (ENVIRONMENT_IS_NODE) {
   scriptDirectory = __dirname + '/';
 
-  // Expose functionality in the same simple way that the shells work
-  // Note that we pollute the global namespace here, otherwise we break in node
-  var nodeFS;
-  var nodePath;
 
   read_ = function shell_read(filename, binary) {
     var ret;
-      if (!nodeFS) nodeFS = require('fs');
-      if (!nodePath) nodePath = require('path');
-      filename = nodePath['normalize'](filename);
-      ret = nodeFS['readFileSync'](filename);
-    return binary ? ret : ret.toString();
+    if (!nodeFS) nodeFS = require('fs');
+    if (!nodePath) nodePath = require('path');
+    filename = nodePath['normalize'](filename);
+    return nodeFS['readFileSync'](filename, binary ? null : 'utf8');
   };
 
   readBinary = function readBinary(filename) {
@@ -153,6 +144,9 @@ if (ENVIRONMENT_IS_NODE) {
     assert(ret.buffer);
     return ret;
   };
+
+
+
 
   if (process['argv'].length > 1) {
     thisProgram = process['argv'][1].replace(/\\/g, '/');
@@ -176,6 +170,8 @@ if (ENVIRONMENT_IS_NODE) {
   };
 
   Module['inspect'] = function () { return '[Emscripten Module object]'; };
+
+
 } else
 if (ENVIRONMENT_IS_SHELL) {
 
@@ -215,6 +211,10 @@ if (ENVIRONMENT_IS_SHELL) {
     console.warn = console.error = typeof printErr !== 'undefined' ? printErr : print;
   }
 } else
+
+// Note that this includes Node.js workers when relevant (pthreads is enabled).
+// Node.js workers are detected as a combination of ENVIRONMENT_IS_WORKER and
+// ENVIRONMENT_HAS_NODE.
 if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
   if (ENVIRONMENT_IS_WORKER) { // Check worker, not web, since window could be polyfilled
     scriptDirectory = self.location.href;
@@ -235,6 +235,11 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
   } else {
     scriptDirectory = '';
   }
+
+
+  // Differentiate the Web Worker from the Node Worker case, as reading must
+  // be done differently.
+  {
 
 
   read_ = function shell_read(url) {
@@ -269,10 +274,16 @@ if (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER) {
     xhr.send(null);
   };
 
+
+
+
+  }
+
   setWindowTitle = function(title) { document.title = title };
 } else
 {
 }
+
 
 // Set up the out() and err() hooks, which are how we can print to stdout or
 // stderr, respectively.
@@ -622,8 +633,14 @@ function getValue(ptr, type, noSafe) {
 
 var wasmMemory;
 
-// Potentially used for direct table calls.
-var wasmTable;
+// In fastcomp asm.js, we don't need a wasm Table at all.
+// In the wasm backend, we polyfill the WebAssembly object,
+// so this creates a (non-native-wasm) table for us.
+var wasmTable = new WebAssembly.Table({
+  'initial': 448,
+  'maximum': 448,
+  'element': 'anyfunc'
+});
 
 
 //========================================
@@ -1219,13 +1236,12 @@ function updateGlobalBufferAndViews(buf) {
   Module['HEAPF64'] = HEAPF64 = new Float64Array(buf);
 }
 
-
 var STATIC_BASE = 1024,
-    STACK_BASE = 13376,
+    STACK_BASE = 13360,
     STACKTOP = STACK_BASE,
-    STACK_MAX = 5256256,
-    DYNAMIC_BASE = 5256256,
-    DYNAMICTOP_PTR = 13344;
+    STACK_MAX = 5256240,
+    DYNAMIC_BASE = 5256240,
+    DYNAMICTOP_PTR = 13168;
 
 
 
@@ -1240,6 +1256,11 @@ var INITIAL_TOTAL_MEMORY = Module['TOTAL_MEMORY'] || 16777216;
 
 
 
+// In standalone mode, the wasm creates the memory, and the user can't provide it.
+// In non-standalone/normal mode, we create the memory here.
+
+// Create the main memory. (Note: this isn't used in STANDALONE_WASM mode since the wasm
+// memory is created in the wasm, not in JS.)
 
   if (Module['wasmMemory']) {
     wasmMemory = Module['wasmMemory'];
@@ -1263,6 +1284,7 @@ INITIAL_TOTAL_MEMORY = buffer.byteLength;
 updateGlobalBufferAndViews(buffer);
 
 HEAP32[DYNAMICTOP_PTR>>2] = DYNAMIC_BASE;
+
 
 
 
@@ -1455,6 +1477,27 @@ Module["preloadedImages"] = {}; // maps url to image data
 Module["preloadedAudios"] = {}; // maps url to audio data
 
 
+function abort(what) {
+  if (Module['onAbort']) {
+    Module['onAbort'](what);
+  }
+
+  what += '';
+  out(what);
+  err(what);
+
+  ABORT = true;
+  EXITSTATUS = 1;
+
+  what = 'abort(' + what + '). Build with -s ASSERTIONS=1 for more info.';
+
+  // Throw a wasm runtime error, because a JS error might be seen as a foreign
+  // exception, which means we'd run destructors on it. We need the error to
+  // simply make the program stop.
+  throw new WebAssembly.RuntimeError(what);
+}
+
+
 var memoryInitializer = null;
 
 
@@ -1526,11 +1569,11 @@ function getBinaryPromise() {
 
 // Create the wasm instance.
 // Receives the wasm imports, returns the exports.
-function createWasm(env) {
-
+function createWasm() {
   // prepare imports
   var info = {
-    'env': env
+    'env': asmLibraryArg,
+    'wasi_unstable': asmLibraryArg
     ,
     'global': {
       'NaN': NaN,
@@ -1606,29 +1649,7 @@ function createWasm(env) {
   return {}; // no exports yet; we'll fill them in later
 }
 
-// Provide an "asm.js function" for the application, called to "link" the asm.js module. We instantiate
-// the wasm module at that time, and it receives imports and provides exports and so forth, the app
-// doesn't need to care that it is wasm or asm.js.
-
-Module['asm'] = function(global, env, providedBuffer) {
-  // memory was already allocated (so js could use the buffer)
-  env['memory'] = wasmMemory
-  ;
-  // import table
-  env['table'] = wasmTable = new WebAssembly.Table({
-    'initial': 448,
-    'maximum': 448,
-    'element': 'anyfunc'
-  });
-  // With the wasm backend __memory_base and __table_base and only needed for
-  // relocatable output.
-  env['__memory_base'] = 1024; // tell the memory segments where to place themselves
-  // table starts at 0 by default (even in dynamic linking, for the main module)
-  env['__table_base'] = 0;
-
-  var exports = createWasm(env);
-  return exports;
-};
+Module['asm'] = createWasm;
 
 // Globals used by JS i64 conversions
 var tempDouble;
@@ -1678,7 +1699,7 @@ function _emscripten_asm_const_di(code, a0) {
 
 
 
-// STATICTOP = STATIC_BASE + 12352;
+// STATICTOP = STATIC_BASE + 12336;
 /* global initializers */ /*__ATINIT__.push();*/
 
 
@@ -1689,7 +1710,7 @@ function _emscripten_asm_const_di(code, a0) {
 
 
 /* no memory initializer */
-var tempDoublePtr = 13360
+var tempDoublePtr = 13344
 
 function copyTempFloat(ptr) { // functions, because inlining this code increases code size too much
   HEAP8[tempDoublePtr] = HEAP8[ptr];
@@ -1753,6 +1774,17 @@ function copyTempDouble(ptr) {
     }
   Module["stackTrace"] = stackTrace;
 
+  
+  
+  function flush_NO_FILESYSTEM() {
+      // flush anything remaining in the buffers during shutdown
+      var fflush = Module["_fflush"];
+      if (fflush) fflush(0);
+      var buffers = SYSCALLS.buffers;
+      if (buffers[1].length) SYSCALLS.printChar(1, 10);
+      if (buffers[2].length) SYSCALLS.printChar(2, 10);
+    }
+  Module["flush_NO_FILESYSTEM"] = flush_NO_FILESYSTEM;
   
   
   var PATH={splitPath:function (filename) {
@@ -1842,74 +1874,32 @@ function copyTempDouble(ptr) {
       },getZero:function () {
         SYSCALLS.get();
       }};
-  Module["SYSCALLS"] = SYSCALLS;function ___syscall140(which, varargs) {SYSCALLS.varargs = varargs;
-  try {
-   // llseek
-      var stream = SYSCALLS.getStreamFromFD(), offset_high = SYSCALLS.get(), offset_low = SYSCALLS.get(), result = SYSCALLS.get(), whence = SYSCALLS.get();
-      return 0;
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
-  }
-  }
-  Module["___syscall140"] = ___syscall140;
-
+  Module["SYSCALLS"] = SYSCALLS;function _fd_write(fd, iov, iovcnt, pnum) {try {
   
-  function flush_NO_FILESYSTEM() {
-      // flush anything remaining in the buffers during shutdown
-      var fflush = Module["_fflush"];
-      if (fflush) fflush(0);
-      var buffers = SYSCALLS.buffers;
-      if (buffers[1].length) SYSCALLS.printChar(1, 10);
-      if (buffers[2].length) SYSCALLS.printChar(2, 10);
-    }
-  Module["flush_NO_FILESYSTEM"] = flush_NO_FILESYSTEM;function ___syscall146(which, varargs) {SYSCALLS.varargs = varargs;
-  try {
-   // writev
       // hack to support printf in SYSCALLS_REQUIRE_FILESYSTEM=0
-      var stream = SYSCALLS.get(), iov = SYSCALLS.get(), iovcnt = SYSCALLS.get();
-      var ret = 0;
+      var num = 0;
       for (var i = 0; i < iovcnt; i++) {
         var ptr = HEAP32[(((iov)+(i*8))>>2)];
         var len = HEAP32[(((iov)+(i*8 + 4))>>2)];
         for (var j = 0; j < len; j++) {
-          SYSCALLS.printChar(stream, HEAPU8[ptr+j]);
+          SYSCALLS.printChar(fd, HEAPU8[ptr+j]);
         }
-        ret += len;
+        num += len;
       }
-      return ret;
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
-  }
-  }
-  Module["___syscall146"] = ___syscall146;
-
-  function ___syscall54(which, varargs) {SYSCALLS.varargs = varargs;
-  try {
-   // ioctl
+      HEAP32[((pnum)>>2)]=num
       return 0;
     } catch (e) {
     if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
+    return e.errno;
   }
   }
-  Module["___syscall54"] = ___syscall54;
-
-  function ___syscall6(which, varargs) {SYSCALLS.varargs = varargs;
-  try {
-   // close
-      var stream = SYSCALLS.getStreamFromFD();
-      return 0;
-    } catch (e) {
-    if (typeof FS === 'undefined' || !(e instanceof FS.ErrnoError)) abort(e);
-    return -e.errno;
+  Module["_fd_write"] = _fd_write;function ___wasi_fd_write() {
+  return _fd_write.apply(null, arguments)
   }
-  }
-  Module["___syscall6"] = ___syscall6;
+  Module["___wasi_fd_write"] = ___wasi_fd_write;
 
   function _abort() {
-      Module['abort']();
+      abort();
     }
   Module["_abort"] = _abort;
 
@@ -1923,6 +1913,17 @@ function copyTempDouble(ptr) {
       return HEAP8.length;
     }
   Module["_emscripten_get_heap_size"] = _emscripten_get_heap_size;
+
+   
+
+  
+  function abortOnCannotGrowMemory(requestedSize) {
+      abort('OOM');
+    }
+  Module["abortOnCannotGrowMemory"] = abortOnCannotGrowMemory;function _emscripten_resize_heap(requestedSize) {
+      abortOnCannotGrowMemory(requestedSize);
+    }
+  Module["_emscripten_resize_heap"] = _emscripten_resize_heap;
 
   function _gettimeofday(ptr) {
       var now = Date.now();
@@ -1945,22 +1946,6 @@ function copyTempDouble(ptr) {
    
 
    
-
-  
-  function ___setErrNo(value) {
-      if (Module['___errno_location']) HEAP32[((Module['___errno_location']())>>2)]=value;
-      return value;
-    }
-  Module["___setErrNo"] = ___setErrNo;
-  
-  
-  function abortOnCannotGrowMemory(requestedSize) {
-      abort('OOM');
-    }
-  Module["abortOnCannotGrowMemory"] = abortOnCannotGrowMemory;function _emscripten_resize_heap(requestedSize) {
-      abortOnCannotGrowMemory(requestedSize);
-    }
-  Module["_emscripten_resize_heap"] = _emscripten_resize_heap; 
 var ASSERTIONS = false;
 
 // Copyright 2017 The Emscripten Authors.  All rights reserved.
@@ -2034,44 +2019,7 @@ function jsCall_vji(index,a1,a2) {
 
 var asmGlobalArg = {};
 
-var asmLibraryArg = {
-  "abort": abort,
-  "setTempRet0": setTempRet0,
-  "getTempRet0": getTempRet0,
-  "jsCall_ii": jsCall_ii,
-  "jsCall_iidiiii": jsCall_iidiiii,
-  "jsCall_iii": jsCall_iii,
-  "jsCall_iiii": jsCall_iiii,
-  "jsCall_jiji": jsCall_jiji,
-  "jsCall_vi": jsCall_vi,
-  "jsCall_vii": jsCall_vii,
-  "jsCall_viiii": jsCall_viiii,
-  "jsCall_vji": jsCall_vji,
-  "___setErrNo": ___setErrNo,
-  "___syscall140": ___syscall140,
-  "___syscall146": ___syscall146,
-  "___syscall54": ___syscall54,
-  "___syscall6": ___syscall6,
-  "_abort": _abort,
-  "_emscripten_asm_const_di": _emscripten_asm_const_di,
-  "_emscripten_asm_const_i": _emscripten_asm_const_i,
-  "_emscripten_asm_const_ii": _emscripten_asm_const_ii,
-  "_emscripten_asm_const_iii": _emscripten_asm_const_iii,
-  "_emscripten_asm_const_iiii": _emscripten_asm_const_iiii,
-  "_emscripten_asm_const_iiiii": _emscripten_asm_const_iiiii,
-  "_emscripten_get_heap_size": _emscripten_get_heap_size,
-  "_emscripten_memcpy_big": _emscripten_memcpy_big,
-  "_emscripten_resize_heap": _emscripten_resize_heap,
-  "_gettimeofday": _gettimeofday,
-  "abortOnCannotGrowMemory": abortOnCannotGrowMemory,
-  "demangle": demangle,
-  "demangleAll": demangleAll,
-  "flush_NO_FILESYSTEM": flush_NO_FILESYSTEM,
-  "jsStackTrace": jsStackTrace,
-  "stackTrace": stackTrace,
-  "tempDoublePtr": tempDoublePtr,
-  "DYNAMICTOP_PTR": DYNAMICTOP_PTR
-};
+var asmLibraryArg = { "___wasi_fd_write": ___wasi_fd_write, "__memory_base": 1024, "__table_base": 0, "_abort": _abort, "_emscripten_asm_const_di": _emscripten_asm_const_di, "_emscripten_asm_const_i": _emscripten_asm_const_i, "_emscripten_asm_const_ii": _emscripten_asm_const_ii, "_emscripten_asm_const_iii": _emscripten_asm_const_iii, "_emscripten_asm_const_iiii": _emscripten_asm_const_iiii, "_emscripten_asm_const_iiiii": _emscripten_asm_const_iiiii, "_emscripten_get_heap_size": _emscripten_get_heap_size, "_emscripten_memcpy_big": _emscripten_memcpy_big, "_emscripten_resize_heap": _emscripten_resize_heap, "_fd_write": _fd_write, "_gettimeofday": _gettimeofday, "abort": abort, "abortOnCannotGrowMemory": abortOnCannotGrowMemory, "demangle": demangle, "demangleAll": demangleAll, "flush_NO_FILESYSTEM": flush_NO_FILESYSTEM, "getTempRet0": getTempRet0, "jsCall_ii": jsCall_ii, "jsCall_iidiiii": jsCall_iidiiii, "jsCall_iii": jsCall_iii, "jsCall_iiii": jsCall_iiii, "jsCall_jiji": jsCall_jiji, "jsCall_vi": jsCall_vi, "jsCall_vii": jsCall_vii, "jsCall_viiii": jsCall_viiii, "jsCall_vji": jsCall_vji, "jsStackTrace": jsStackTrace, "memory": wasmMemory, "setTempRet0": setTempRet0, "stackTrace": stackTrace, "table": wasmTable, "tempDoublePtr": tempDoublePtr };
 // EMSCRIPTEN_START_ASM
 var asm =Module["asm"]// EMSCRIPTEN_END_ASM
 (asmGlobalArg, asmLibraryArg, buffer);
@@ -2085,40 +2033,48 @@ var _PICO_TIME_MS = Module["_PICO_TIME_MS"] = function() {
   return Module["asm"]["_PICO_TIME_MS"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_126 = Module["_PICO_TIME_MS_126"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_126"].apply(null, arguments)
+var _PICO_TIME_MS_130 = Module["_PICO_TIME_MS_130"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_130"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_133 = Module["_PICO_TIME_MS_133"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_133"].apply(null, arguments)
+var _PICO_TIME_MS_137 = Module["_PICO_TIME_MS_137"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_137"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_142 = Module["_PICO_TIME_MS_142"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_142"].apply(null, arguments)
+var _PICO_TIME_MS_146 = Module["_PICO_TIME_MS_146"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_146"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_227 = Module["_PICO_TIME_MS_227"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_227"].apply(null, arguments)
+var _PICO_TIME_MS_231 = Module["_PICO_TIME_MS_231"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_231"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_274 = Module["_PICO_TIME_MS_274"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_274"].apply(null, arguments)
+var _PICO_TIME_MS_278 = Module["_PICO_TIME_MS_278"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_278"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_306 = Module["_PICO_TIME_MS_306"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_306"].apply(null, arguments)
+var _PICO_TIME_MS_310 = Module["_PICO_TIME_MS_310"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_310"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_362 = Module["_PICO_TIME_MS_362"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_362"].apply(null, arguments)
+var _PICO_TIME_MS_366 = Module["_PICO_TIME_MS_366"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_366"].apply(null, arguments)
 };
 
-var _PICO_TIME_MS_372 = Module["_PICO_TIME_MS_372"] = function() {
-  return Module["asm"]["_PICO_TIME_MS_372"].apply(null, arguments)
+var _PICO_TIME_MS_376 = Module["_PICO_TIME_MS_376"] = function() {
+  return Module["asm"]["_PICO_TIME_MS_376"].apply(null, arguments)
 };
 
 var ___DOUBLE_BITS_670 = Module["___DOUBLE_BITS_670"] = function() {
   return Module["asm"]["___DOUBLE_BITS_670"].apply(null, arguments)
+};
+
+var ___emscripten_stdout_close = Module["___emscripten_stdout_close"] = function() {
+  return Module["asm"]["___emscripten_stdout_close"].apply(null, arguments)
+};
+
+var ___emscripten_stdout_seek = Module["___emscripten_stdout_seek"] = function() {
+  return Module["asm"]["___emscripten_stdout_seek"].apply(null, arguments)
 };
 
 var ___errno_location = Module["___errno_location"] = function() {
@@ -2141,28 +2097,12 @@ var ___pthread_self_423 = Module["___pthread_self_423"] = function() {
   return Module["asm"]["___pthread_self_423"].apply(null, arguments)
 };
 
-var ___stdio_close = Module["___stdio_close"] = function() {
-  return Module["asm"]["___stdio_close"].apply(null, arguments)
-};
-
-var ___stdio_seek = Module["___stdio_seek"] = function() {
-  return Module["asm"]["___stdio_seek"].apply(null, arguments)
-};
-
 var ___stdio_write = Module["___stdio_write"] = function() {
   return Module["asm"]["___stdio_write"].apply(null, arguments)
 };
 
-var ___stdout_write = Module["___stdout_write"] = function() {
-  return Module["asm"]["___stdout_write"].apply(null, arguments)
-};
-
 var ___stpncpy = Module["___stpncpy"] = function() {
   return Module["asm"]["___stpncpy"].apply(null, arguments)
-};
-
-var ___syscall_ret = Module["___syscall_ret"] = function() {
-  return Module["asm"]["___syscall_ret"].apply(null, arguments)
 };
 
 var ___towrite = Module["___towrite"] = function() {
@@ -2175,6 +2115,10 @@ var ___unlockfile = Module["___unlockfile"] = function() {
 
 var ___vfprintf_internal = Module["___vfprintf_internal"] = function() {
   return Module["asm"]["___vfprintf_internal"].apply(null, arguments)
+};
+
+var ___wasi_syscall_ret = Module["___wasi_syscall_ret"] = function() {
+  return Module["asm"]["___wasi_syscall_ret"].apply(null, arguments)
 };
 
 var __pico_stack_recv_zerocopy = Module["__pico_stack_recv_zerocopy"] = function() {
@@ -2429,8 +2373,8 @@ var _do_enqueue_segment = Module["_do_enqueue_segment"] = function() {
   return Module["asm"]["_do_enqueue_segment"].apply(null, arguments)
 };
 
-var _dummy_560 = Module["_dummy_560"] = function() {
-  return Module["asm"]["_dummy_560"].apply(null, arguments)
+var _emscripten_get_sbrk_ptr = Module["_emscripten_get_sbrk_ptr"] = function() {
+  return Module["asm"]["_emscripten_get_sbrk_ptr"].apply(null, arguments)
 };
 
 var _enqueue_segment_len = Module["_enqueue_segment_len"] = function() {
@@ -2737,6 +2681,10 @@ var _isupper = Module["_isupper"] = function() {
   return Module["asm"]["_isupper"].apply(null, arguments)
 };
 
+var _js_accept_nameserver = Module["_js_accept_nameserver"] = function() {
+  return Module["asm"]["_js_accept_nameserver"].apply(null, arguments)
+};
+
 var _js_add_ipv4 = Module["_js_add_ipv4"] = function() {
   return Module["asm"]["_js_add_ipv4"].apply(null, arguments)
 };
@@ -2777,60 +2725,60 @@ var _long_be = Module["_long_be"] = function() {
   return Module["asm"]["_long_be"].apply(null, arguments)
 };
 
-var _long_be_129 = Module["_long_be_129"] = function() {
-  return Module["asm"]["_long_be_129"].apply(null, arguments)
+var _long_be_133 = Module["_long_be_133"] = function() {
+  return Module["asm"]["_long_be_133"].apply(null, arguments)
 };
 
-var _long_be_143 = Module["_long_be_143"] = function() {
-  return Module["asm"]["_long_be_143"].apply(null, arguments)
+var _long_be_147 = Module["_long_be_147"] = function() {
+  return Module["asm"]["_long_be_147"].apply(null, arguments)
 };
 
-var _long_be_158 = Module["_long_be_158"] = function() {
-  return Module["asm"]["_long_be_158"].apply(null, arguments)
+var _long_be_162 = Module["_long_be_162"] = function() {
+  return Module["asm"]["_long_be_162"].apply(null, arguments)
 };
 
-var _long_be_307 = Module["_long_be_307"] = function() {
-  return Module["asm"]["_long_be_307"].apply(null, arguments)
+var _long_be_311 = Module["_long_be_311"] = function() {
+  return Module["asm"]["_long_be_311"].apply(null, arguments)
 };
 
-var _long_be_325 = Module["_long_be_325"] = function() {
-  return Module["asm"]["_long_be_325"].apply(null, arguments)
+var _long_be_329 = Module["_long_be_329"] = function() {
+  return Module["asm"]["_long_be_329"].apply(null, arguments)
 };
 
-var _long_be_336 = Module["_long_be_336"] = function() {
-  return Module["asm"]["_long_be_336"].apply(null, arguments)
+var _long_be_340 = Module["_long_be_340"] = function() {
+  return Module["asm"]["_long_be_340"].apply(null, arguments)
 };
 
-var _long_be_35 = Module["_long_be_35"] = function() {
-  return Module["asm"]["_long_be_35"].apply(null, arguments)
-};
-
-var _long_be_364 = Module["_long_be_364"] = function() {
-  return Module["asm"]["_long_be_364"].apply(null, arguments)
+var _long_be_368 = Module["_long_be_368"] = function() {
+  return Module["asm"]["_long_be_368"].apply(null, arguments)
 };
 
 var _long_be_37 = Module["_long_be_37"] = function() {
   return Module["asm"]["_long_be_37"].apply(null, arguments)
 };
 
-var _long_be_377 = Module["_long_be_377"] = function() {
-  return Module["asm"]["_long_be_377"].apply(null, arguments)
+var _long_be_381 = Module["_long_be_381"] = function() {
+  return Module["asm"]["_long_be_381"].apply(null, arguments)
 };
 
-var _long_be_65 = Module["_long_be_65"] = function() {
-  return Module["asm"]["_long_be_65"].apply(null, arguments)
+var _long_be_39 = Module["_long_be_39"] = function() {
+  return Module["asm"]["_long_be_39"].apply(null, arguments)
+};
+
+var _long_be_69 = Module["_long_be_69"] = function() {
+  return Module["asm"]["_long_be_69"].apply(null, arguments)
 };
 
 var _long_from = Module["_long_from"] = function() {
   return Module["asm"]["_long_from"].apply(null, arguments)
 };
 
-var _long_from_148 = Module["_long_from_148"] = function() {
-  return Module["asm"]["_long_from_148"].apply(null, arguments)
+var _long_from_152 = Module["_long_from_152"] = function() {
+  return Module["asm"]["_long_from_152"].apply(null, arguments)
 };
 
-var _long_from_85 = Module["_long_from_85"] = function() {
-  return Module["asm"]["_long_from_85"].apply(null, arguments)
+var _long_from_89 = Module["_long_from_89"] = function() {
+  return Module["asm"]["_long_from_89"].apply(null, arguments)
 };
 
 var _main = Module["_main"] = function() {
@@ -3237,16 +3185,16 @@ var _pico_dequeue = Module["_pico_dequeue"] = function() {
   return Module["asm"]["_pico_dequeue"].apply(null, arguments)
 };
 
-var _pico_dequeue_162 = Module["_pico_dequeue_162"] = function() {
-  return Module["asm"]["_pico_dequeue_162"].apply(null, arguments)
+var _pico_dequeue_166 = Module["_pico_dequeue_166"] = function() {
+  return Module["asm"]["_pico_dequeue_166"].apply(null, arguments)
 };
 
-var _pico_dequeue_186 = Module["_pico_dequeue_186"] = function() {
-  return Module["asm"]["_pico_dequeue_186"].apply(null, arguments)
+var _pico_dequeue_190 = Module["_pico_dequeue_190"] = function() {
+  return Module["asm"]["_pico_dequeue_190"].apply(null, arguments)
 };
 
-var _pico_dequeue_418 = Module["_pico_dequeue_418"] = function() {
-  return Module["asm"]["_pico_dequeue_418"].apply(null, arguments)
+var _pico_dequeue_422 = Module["_pico_dequeue_422"] = function() {
+  return Module["asm"]["_pico_dequeue_422"].apply(null, arguments)
 };
 
 var _pico_dev_cmp = Module["_pico_dev_cmp"] = function() {
@@ -3359,6 +3307,10 @@ var _pico_dhcp_client_wakeup = Module["_pico_dhcp_client_wakeup"] = function() {
 
 var _pico_dhcp_get_address = Module["_pico_dhcp_get_address"] = function() {
   return Module["asm"]["_pico_dhcp_get_address"].apply(null, arguments)
+};
+
+var _pico_dhcp_get_nameserver = Module["_pico_dhcp_get_nameserver"] = function() {
+  return Module["asm"]["_pico_dhcp_get_nameserver"].apply(null, arguments)
 };
 
 var _pico_dhcp_initiate_negotiation = Module["_pico_dhcp_initiate_negotiation"] = function() {
@@ -3613,28 +3565,28 @@ var _pico_enqueue = Module["_pico_enqueue"] = function() {
   return Module["asm"]["_pico_enqueue"].apply(null, arguments)
 };
 
-var _pico_enqueue_107 = Module["_pico_enqueue_107"] = function() {
-  return Module["asm"]["_pico_enqueue_107"].apply(null, arguments)
+var _pico_enqueue_111 = Module["_pico_enqueue_111"] = function() {
+  return Module["asm"]["_pico_enqueue_111"].apply(null, arguments)
 };
 
-var _pico_enqueue_147 = Module["_pico_enqueue_147"] = function() {
-  return Module["asm"]["_pico_enqueue_147"].apply(null, arguments)
+var _pico_enqueue_151 = Module["_pico_enqueue_151"] = function() {
+  return Module["asm"]["_pico_enqueue_151"].apply(null, arguments)
 };
 
-var _pico_enqueue_153 = Module["_pico_enqueue_153"] = function() {
-  return Module["asm"]["_pico_enqueue_153"].apply(null, arguments)
+var _pico_enqueue_157 = Module["_pico_enqueue_157"] = function() {
+  return Module["asm"]["_pico_enqueue_157"].apply(null, arguments)
 };
 
-var _pico_enqueue_253 = Module["_pico_enqueue_253"] = function() {
-  return Module["asm"]["_pico_enqueue_253"].apply(null, arguments)
+var _pico_enqueue_257 = Module["_pico_enqueue_257"] = function() {
+  return Module["asm"]["_pico_enqueue_257"].apply(null, arguments)
 };
 
-var _pico_enqueue_322 = Module["_pico_enqueue_322"] = function() {
-  return Module["asm"]["_pico_enqueue_322"].apply(null, arguments)
+var _pico_enqueue_326 = Module["_pico_enqueue_326"] = function() {
+  return Module["asm"]["_pico_enqueue_326"].apply(null, arguments)
 };
 
-var _pico_enqueue_411 = Module["_pico_enqueue_411"] = function() {
-  return Module["asm"]["_pico_enqueue_411"].apply(null, arguments)
+var _pico_enqueue_415 = Module["_pico_enqueue_415"] = function() {
+  return Module["asm"]["_pico_enqueue_415"].apply(null, arguments)
 };
 
 var _pico_enqueue_and_wakeup_if_needed = Module["_pico_enqueue_and_wakeup_if_needed"] = function() {
@@ -3789,8 +3741,8 @@ var _pico_hash = Module["_pico_hash"] = function() {
   return Module["asm"]["_pico_hash"].apply(null, arguments)
 };
 
-var _pico_hash_427 = Module["_pico_hash_427"] = function() {
-  return Module["asm"]["_pico_hash_427"].apply(null, arguments)
+var _pico_hash_431 = Module["_pico_hash_431"] = function() {
+  return Module["asm"]["_pico_hash_431"].apply(null, arguments)
 };
 
 var _pico_hold_segment_make = Module["_pico_hold_segment_make"] = function() {
@@ -4869,8 +4821,8 @@ var _pico_queue_peek = Module["_pico_queue_peek"] = function() {
   return Module["asm"]["_pico_queue_peek"].apply(null, arguments)
 };
 
-var _pico_queue_peek_163 = Module["_pico_queue_peek_163"] = function() {
-  return Module["asm"]["_pico_queue_peek_163"].apply(null, arguments)
+var _pico_queue_peek_167 = Module["_pico_queue_peek_167"] = function() {
+  return Module["asm"]["_pico_queue_peek_167"].apply(null, arguments)
 };
 
 var _pico_rand = Module["_pico_rand"] = function() {
@@ -5581,80 +5533,80 @@ var _short_be_1 = Module["_short_be_1"] = function() {
   return Module["asm"]["_short_be_1"].apply(null, arguments)
 };
 
-var _short_be_108 = Module["_short_be_108"] = function() {
-  return Module["asm"]["_short_be_108"].apply(null, arguments)
+var _short_be_112 = Module["_short_be_112"] = function() {
+  return Module["asm"]["_short_be_112"].apply(null, arguments)
 };
 
-var _short_be_136 = Module["_short_be_136"] = function() {
-  return Module["asm"]["_short_be_136"].apply(null, arguments)
+var _short_be_140 = Module["_short_be_140"] = function() {
+  return Module["asm"]["_short_be_140"].apply(null, arguments)
 };
 
-var _short_be_139 = Module["_short_be_139"] = function() {
-  return Module["asm"]["_short_be_139"].apply(null, arguments)
+var _short_be_143 = Module["_short_be_143"] = function() {
+  return Module["asm"]["_short_be_143"].apply(null, arguments)
 };
 
-var _short_be_146 = Module["_short_be_146"] = function() {
-  return Module["asm"]["_short_be_146"].apply(null, arguments)
+var _short_be_150 = Module["_short_be_150"] = function() {
+  return Module["asm"]["_short_be_150"].apply(null, arguments)
 };
 
-var _short_be_152 = Module["_short_be_152"] = function() {
-  return Module["asm"]["_short_be_152"].apply(null, arguments)
+var _short_be_156 = Module["_short_be_156"] = function() {
+  return Module["asm"]["_short_be_156"].apply(null, arguments)
 };
 
-var _short_be_174 = Module["_short_be_174"] = function() {
-  return Module["asm"]["_short_be_174"].apply(null, arguments)
+var _short_be_178 = Module["_short_be_178"] = function() {
+  return Module["asm"]["_short_be_178"].apply(null, arguments)
 };
 
-var _short_be_205 = Module["_short_be_205"] = function() {
-  return Module["asm"]["_short_be_205"].apply(null, arguments)
+var _short_be_209 = Module["_short_be_209"] = function() {
+  return Module["asm"]["_short_be_209"].apply(null, arguments)
 };
 
-var _short_be_305 = Module["_short_be_305"] = function() {
-  return Module["asm"]["_short_be_305"].apply(null, arguments)
+var _short_be_309 = Module["_short_be_309"] = function() {
+  return Module["asm"]["_short_be_309"].apply(null, arguments)
 };
 
-var _short_be_31 = Module["_short_be_31"] = function() {
-  return Module["asm"]["_short_be_31"].apply(null, arguments)
+var _short_be_33 = Module["_short_be_33"] = function() {
+  return Module["asm"]["_short_be_33"].apply(null, arguments)
 };
 
-var _short_be_332 = Module["_short_be_332"] = function() {
-  return Module["asm"]["_short_be_332"].apply(null, arguments)
-};
-
-var _short_be_34 = Module["_short_be_34"] = function() {
-  return Module["asm"]["_short_be_34"].apply(null, arguments)
+var _short_be_336 = Module["_short_be_336"] = function() {
+  return Module["asm"]["_short_be_336"].apply(null, arguments)
 };
 
 var _short_be_36 = Module["_short_be_36"] = function() {
   return Module["asm"]["_short_be_36"].apply(null, arguments)
 };
 
-var _short_be_363 = Module["_short_be_363"] = function() {
-  return Module["asm"]["_short_be_363"].apply(null, arguments)
+var _short_be_367 = Module["_short_be_367"] = function() {
+  return Module["asm"]["_short_be_367"].apply(null, arguments)
 };
 
-var _short_be_369 = Module["_short_be_369"] = function() {
-  return Module["asm"]["_short_be_369"].apply(null, arguments)
+var _short_be_373 = Module["_short_be_373"] = function() {
+  return Module["asm"]["_short_be_373"].apply(null, arguments)
 };
 
-var _short_be_55 = Module["_short_be_55"] = function() {
-  return Module["asm"]["_short_be_55"].apply(null, arguments)
+var _short_be_38 = Module["_short_be_38"] = function() {
+  return Module["asm"]["_short_be_38"].apply(null, arguments)
 };
 
-var _short_be_61 = Module["_short_be_61"] = function() {
-  return Module["asm"]["_short_be_61"].apply(null, arguments)
+var _short_be_59 = Module["_short_be_59"] = function() {
+  return Module["asm"]["_short_be_59"].apply(null, arguments)
 };
 
-var _short_be_70 = Module["_short_be_70"] = function() {
-  return Module["asm"]["_short_be_70"].apply(null, arguments)
+var _short_be_65 = Module["_short_be_65"] = function() {
+  return Module["asm"]["_short_be_65"].apply(null, arguments)
+};
+
+var _short_be_74 = Module["_short_be_74"] = function() {
+  return Module["asm"]["_short_be_74"].apply(null, arguments)
 };
 
 var _short_from = Module["_short_from"] = function() {
   return Module["asm"]["_short_from"].apply(null, arguments)
 };
 
-var _short_from_149 = Module["_short_from_149"] = function() {
-  return Module["asm"]["_short_from_149"].apply(null, arguments)
+var _short_from_153 = Module["_short_from_153"] = function() {
+  return Module["asm"]["_short_from_153"].apply(null, arguments)
 };
 
 var _slifs = Module["_slifs"] = function() {
@@ -6208,6 +6160,7 @@ Module["removeFunction"] = removeFunction;
 
 
 
+
 var calledRun;
 
 // Modularize mode returns a function, which can be called to
@@ -6245,6 +6198,7 @@ function ExitStatus(status) {
 
 var calledMain = false;
 
+
 dependenciesFulfilled = function runCaller() {
   // If run has never been called, and we should call run (INVOKE_RUN is true, and Module.noInitialRun is not false)
   if (!calledRun) run();
@@ -6252,6 +6206,8 @@ dependenciesFulfilled = function runCaller() {
 };
 
 function callMain(args) {
+
+  var entryFunction = Module['_main'];
 
 
   args = args || [];
@@ -6268,7 +6224,7 @@ function callMain(args) {
   try {
 
 
-    var ret = Module['_main'](argc, argv);
+    var ret = entryFunction(argc, argv);
 
 
     // if we're not running an evented main loop, it's time to exit
@@ -6370,24 +6326,6 @@ function exit(status, implicit) {
 
   quit_(status, new ExitStatus(status));
 }
-
-var abortDecorators = [];
-
-function abort(what) {
-  if (Module['onAbort']) {
-    Module['onAbort'](what);
-  }
-
-  what += '';
-  out(what);
-  err(what);
-
-  ABORT = true;
-  EXITSTATUS = 1;
-
-  throw 'abort(' + what + '). Build with -s ASSERTIONS=1 for more info.';
-}
-Module['abort'] = abort;
 
 if (Module['preInit']) {
   if (typeof Module['preInit'] == 'function') Module['preInit'] = [Module['preInit']];
